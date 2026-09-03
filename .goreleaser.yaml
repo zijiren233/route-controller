@@ -1,0 +1,37 @@
+version: 2
+
+project_name: route-controller
+
+builds:
+  - id: route-controller
+    main: ./cmd/route-controller
+    binary: route-controller
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/zijiren233/route-controller/internal/version.Version={{.Version}}
+        -X github.com/zijiren233/route-controller/internal/version.GitCommit={{.Commit}}
+        -X github.com/zijiren233/route-controller/internal/version.BuildDate={{.Date}}
+
+archives:
+  - formats:
+      - tar.gz
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'

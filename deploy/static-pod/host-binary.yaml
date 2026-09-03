@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: route-controller
+  namespace: kube-system
+  annotations:
+    route-controller.io/binary-checksum: BINARY_CHECKSUM
+spec:
+  hostNetwork: true
+  priorityClassName: system-node-critical
+  restartPolicy: Always
+  terminationGracePeriodSeconds: 15
+  containers:
+    - name: controller
+      image: SANDBOX_IMAGE
+      imagePullPolicy: IfNotPresent
+      command:
+        - /opt/route-controller
+      args:
+        - run
+        - --config=/etc/route-controller/config.yaml
+        - DRY_RUN_ARGUMENT
+      securityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+        runAsGroup: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop:
+            - ALL
+          add:
+            - NET_ADMIN
+      startupProbe:
+        httpGet:
+          host: 127.0.0.1
+          path: /healthz
+          port: 9919
+        failureThreshold: 30
+        periodSeconds: 2
+      livenessProbe:
+        httpGet:
+          host: 127.0.0.1
+          path: /healthz
+          port: 9919
+        periodSeconds: 10
+        timeoutSeconds: 2
+      readinessProbe:
+        httpGet:
+          host: 127.0.0.1
+          path: /readyz
+          port: 9919
+        periodSeconds: 5
+        timeoutSeconds: 2
+      resources:
+        requests:
+          cpu: 20m
+          memory: 32Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+      volumeMounts:
+        - name: binary
+          mountPath: /opt/route-controller
+          readOnly: true
+        - name: config
+          mountPath: /etc/route-controller/config.yaml
+          readOnly: true
+        - name: kubeconfig
+          mountPath: /etc/route-controller/kubeconfig
+          readOnly: true
+  volumes:
+    - name: binary
+      hostPath:
+        path: /etc/kubernetes/route-controller/route-controller
+        type: File
+    - name: config
+      hostPath:
+        path: /etc/kubernetes/route-controller/config.yaml
+        type: File
+    - name: kubeconfig
+      hostPath:
+        path: /etc/kubernetes/route-controller/kubeconfig
+        type: File

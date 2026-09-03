@@ -1,0 +1,30 @@
+kubernetes:
+  kubeconfig: /etc/route-controller/kubeconfig
+  qps: 10
+  burst: 20
+
+routes:
+  interface: eth0
+  pod-cidr: 10.0.0.0/10
+  service-cidr: 10.192.0.0/12
+  router-cidr: 192.0.2.0/24
+  table: 254
+  protocol: 99
+
+controller:
+  reconcile-period: 10s
+  dry-run: false
+
+probe:
+  port: 4240
+  timeout: 2s
+  failure-threshold: 3
+  success-threshold: 1
+
+observability:
+  metrics-bind-address: 127.0.0.1:9918
+  health-probe-bind-address: 127.0.0.1:9919
+
+logging:
+  level: info
+  format: json
