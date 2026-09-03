@@ -16,10 +16,10 @@ import (
 )
 
 type netlinkAPI interface {
-	LinkByName(string) (netlink.Link, error)
-	RouteListFiltered(int, *netlink.Route, uint64) ([]netlink.Route, error)
-	RouteReplace(*netlink.Route) error
-	RouteDel(*netlink.Route) error
+	LinkByName(name string) (netlink.Link, error)
+	RouteListFiltered(family int, filter *netlink.Route, mask uint64) ([]netlink.Route, error)
+	RouteReplace(route *netlink.Route) error
+	RouteDel(route *netlink.Route) error
 }
 
 type systemNetlink struct{}
@@ -28,7 +28,11 @@ func (systemNetlink) LinkByName(name string) (netlink.Link, error) {
 	return netlink.LinkByName(name)
 }
 
-func (systemNetlink) RouteListFiltered(family int, filter *netlink.Route, mask uint64) ([]netlink.Route, error) {
+func (systemNetlink) RouteListFiltered(
+	family int,
+	filter *netlink.Route,
+	mask uint64,
+) ([]netlink.Route, error) {
 	return netlink.RouteListFiltered(family, filter, mask)
 }
 
@@ -71,6 +75,7 @@ func newNetlinkBackend(
 	if err != nil {
 		return nil, fmt.Errorf("find interface %q: %w", interfaceName, err)
 	}
+
 	return &NetlinkBackend{
 		api:         api,
 		linkIndex:   link.Attrs().Index,
@@ -89,6 +94,7 @@ func (backend *NetlinkBackend) Reconcile(
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
+
 	existing, err := backend.api.RouteListFiltered(
 		netlink.FAMILY_V4,
 		&netlink.Route{Table: backend.table},
@@ -104,22 +110,28 @@ func (backend *NetlinkBackend) Reconcile(
 	}
 
 	result := Result{Actions: make([]Action, 0)}
+
 	desiredDestinations := make(map[netip.Prefix]struct{}, len(desired))
 	for _, wanted := range desired {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
+
 		desiredDestinations[wanted.Destination] = struct{}{}
+
 		current := ownedRoute(byDestination[wanted.Destination], backend.protocol)
-		if current != nil && sameRoute(*current, wanted, backend.linkIndex, backend.table, backend.protocol) {
+		if current != nil &&
+			sameRoute(*current, wanted, backend.linkIndex, backend.table, backend.protocol) {
 			continue
 		}
 
 		action := Action{Type: ActionReplace, Destination: wanted.Destination}
 		result.Actions = append(result.Actions, action)
+
 		if options.DryRun {
 			continue
 		}
+
 		if replaceErr := backend.api.RouteReplace(
 			buildRoute(wanted, backend.linkIndex, backend.table, backend.protocol),
 		); replaceErr != nil {
@@ -130,22 +142,32 @@ func (backend *NetlinkBackend) Reconcile(
 	if options.Prune {
 		for index := range existing {
 			current := &existing[index]
+
 			destination, ok := routeDestination(current)
-			if !ok || current.Protocol != backend.protocol || !backend.managedDestination(destination) {
+			if !ok || current.Protocol != backend.protocol ||
+				!backend.managedDestination(destination) {
 				continue
 			}
+
 			if _, wanted := desiredDestinations[destination]; wanted {
 				continue
 			}
+
 			if err := ctx.Err(); err != nil {
 				return result, err
 			}
+
 			action := Action{Type: ActionDelete, Destination: destination}
 			result.Actions = append(result.Actions, action)
+
 			if options.DryRun {
 				continue
 			}
-			if deleteErr := backend.api.RouteDel(current); deleteErr != nil && !errors.Is(deleteErr, unix.ESRCH) {
+
+			if deleteErr := backend.api.RouteDel(
+				current,
+			); deleteErr != nil &&
+				!errors.Is(deleteErr, unix.ESRCH) {
 				return result, fmt.Errorf("%s: %w", action, deleteErr)
 			}
 		}
@@ -154,6 +176,7 @@ func (backend *NetlinkBackend) Reconcile(
 	slices.SortFunc(result.Actions, func(first, second Action) int {
 		return strings.Compare(first.String(), second.String())
 	})
+
 	return result, nil
 }
 
@@ -167,16 +190,23 @@ func (backend *NetlinkBackend) checkConflicts(
 			if current.Protocol != backend.protocol {
 				conflicts = append(
 					conflicts,
-					fmt.Sprintf("%s already exists with protocol %d", wanted.Destination, current.Protocol),
+					fmt.Sprintf(
+						"%s already exists with protocol %d",
+						wanted.Destination,
+						current.Protocol,
+					),
 				)
 			}
 		}
 	}
+
 	if len(conflicts) == 0 {
 		return nil
 	}
+
 	slices.Sort(conflicts)
 	conflicts = slices.Compact(conflicts)
+
 	return fmt.Errorf("route conflict: %s", strings.Join(conflicts, "; "))
 }
 
@@ -192,6 +222,7 @@ func indexByDestination(routes []netlink.Route) map[netip.Prefix][]netlink.Route
 			indexed[destination] = append(indexed[destination], current)
 		}
 	}
+
 	return indexed
 }
 
@@ -199,10 +230,12 @@ func routeDestination(route *netlink.Route) (netip.Prefix, bool) {
 	if route.Dst == nil {
 		return netip.Prefix{}, false
 	}
+
 	destination, err := netip.ParsePrefix(route.Dst.String())
 	if err != nil || !destination.Addr().Is4() {
 		return netip.Prefix{}, false
 	}
+
 	return destination.Masked(), true
 }
 
@@ -212,6 +245,7 @@ func ownedRoute(routes []netlink.Route, protocol netlink.RouteProtocol) *netlink
 			return &routes[index]
 		}
 	}
+
 	return nil
 }
 
@@ -233,7 +267,9 @@ func buildRoute(
 		route.Gw = addressToIP(wanted.Gateways[0])
 		return route
 	}
+
 	route.LinkIndex = 0
+
 	route.MultiPath = make([]*netlink.NexthopInfo, 0, len(wanted.Gateways))
 	for _, gateway := range wanted.Gateways {
 		route.MultiPath = append(route.MultiPath, &netlink.NexthopInfo{
@@ -242,6 +278,7 @@ func buildRoute(
 			Hops:      0,
 		})
 	}
+
 	return route
 }
 
@@ -258,10 +295,14 @@ func sameRoute(
 		current.Type != unix.RTN_UNICAST {
 		return false
 	}
+
 	actual := routeGateways(current, linkIndex)
+
 	expected := append([]netip.Addr(nil), wanted.Gateways...)
+
 	slices.SortFunc(actual, netip.Addr.Compare)
 	slices.SortFunc(expected, netip.Addr.Compare)
+
 	return slices.Equal(actual, expected)
 }
 
@@ -272,14 +313,17 @@ func routeGateways(current netlink.Route, linkIndex int) []netip.Addr {
 			gateways = append(gateways, gateway.Unmap())
 		}
 	}
+
 	for _, nextHop := range current.MultiPath {
 		if nextHop.Gw == nil || nextHop.LinkIndex != linkIndex {
 			continue
 		}
+
 		if gateway, ok := netip.AddrFromSlice(nextHop.Gw); ok {
 			gateways = append(gateways, gateway.Unmap())
 		}
 	}
+
 	return gateways
 }
 

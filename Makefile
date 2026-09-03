@@ -29,10 +29,10 @@ integration-test:
 	go test -count=1 -tags=integration ./test/integration/...
 
 lint:
-	golangci-lint run
+	GOOS=linux golangci-lint run
 
 lint-fix:
-	golangci-lint run --fix
+	GOOS=linux golangci-lint run --fix
 
 vet:
 	go vet ./...

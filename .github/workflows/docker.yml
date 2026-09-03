@@ -26,7 +26,9 @@ jobs:
     outputs:
       meta-images: ${{ steps.meta-images.outputs.value }}
       image-tag: ${{ steps.meta-images.outputs.image-tag }}
+      build-date: ${{ steps.meta-images.outputs.build-date }}
     steps:
+      - uses: actions/checkout@v6
       - name: Build image metadata inputs
         id: meta-images
         env:
@@ -36,6 +38,7 @@ jobs:
           DEFAULT_REPOSITORY_NAME: ${{ github.event.repository.name }}
         run: |
           image_tag="sha-${GITHUB_SHA::7}"
+          build_date="$(git show --no-patch --format=%cI "$GITHUB_SHA")"
           if [ -n "$DOCKERHUB_REPOSITORY" ]; then
             case "$DOCKERHUB_REPOSITORY" in
               */*) dockerhub_repository="$DOCKERHUB_REPOSITORY" ;;
@@ -46,6 +49,7 @@ jobs:
           fi
           {
             echo "image-tag=$image_tag"
+            echo "build-date=$build_date"
             echo 'value<<EOF'
             echo "ghcr.io/$GHCR_REPOSITORY"
             if [ -n "$dockerhub_repository" ]; then
@@ -74,7 +78,7 @@ jobs:
       build-args: |
         VERSION={{meta.version}}
         GIT_COMMIT=${{ github.sha }}
-        BUILD_DATE={{commit_date 'YYYY-MM-DDTHH:mm:ssZ'}}
+        BUILD_DATE=${{ needs.docker-prepare.outputs.build-date }}
       artifact-upload: false
       sign: ${{ github.event_name == 'push' && 'auto' || 'false' }}
       cache: true

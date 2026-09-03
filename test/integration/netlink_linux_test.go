@@ -4,7 +4,6 @@ package integration_test
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -13,7 +12,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
-
 	"github.com/zijiren233/route-controller/internal/route"
 )
 
@@ -92,22 +90,27 @@ func TestNetlinkLifecycle(t *testing.T) {
 
 func routesInIntegrationTable(t *testing.T) []netlink.Route {
 	t.Helper()
+
 	routes, err := netlink.RouteListFiltered(
 		netlink.FAMILY_V4,
 		&netlink.Route{Table: integrationTable},
 		netlink.RT_FILTER_TABLE,
 	)
 	require.NoError(t, err)
+
 	return routes
 }
 
 func desiredRoute(t *testing.T, destination string, gateways ...string) route.Desired {
 	t.Helper()
+
 	addresses := make([]netip.Addr, 0, len(gateways))
 	for _, gateway := range gateways {
 		addresses = append(addresses, netip.MustParseAddr(gateway))
 	}
+
 	desired, err := route.NewDesired(netip.MustParsePrefix(destination), addresses...)
-	require.NoError(t, err, fmt.Sprintf("build route %s", destination))
+	require.NoError(t, err, "build route "+destination)
+
 	return desired
 }

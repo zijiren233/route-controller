@@ -158,15 +158,19 @@ func (api *fakeNetlink) RouteListFiltered(int, *netlink.Route, uint64) ([]netlin
 
 func (api *fakeNetlink) RouteReplace(replacement *netlink.Route) error {
 	api.replaceCalls++
+
 	wantedDestination, _ := routeDestination(replacement)
 	for index := range api.routes {
 		destination, ok := routeDestination(&api.routes[index])
-		if ok && destination == wantedDestination && api.routes[index].Protocol == replacement.Protocol {
+		if ok && destination == wantedDestination &&
+			api.routes[index].Protocol == replacement.Protocol {
 			api.routes[index] = *replacement
 			return nil
 		}
 	}
+
 	api.routes = append(api.routes, *replacement)
+
 	return nil
 }
 
@@ -177,16 +181,20 @@ func (api *fakeNetlink) RouteDel(deleted *netlink.Route) error {
 			return nil
 		}
 	}
+
 	return nil
 }
 
 func mustDesired(t *testing.T, destination string, gateways ...string) Desired {
 	t.Helper()
+
 	addresses := make([]netip.Addr, 0, len(gateways))
 	for _, gateway := range gateways {
 		addresses = append(addresses, netip.MustParseAddr(gateway))
 	}
+
 	desired, err := NewDesired(netip.MustParsePrefix(destination), addresses...)
 	require.NoError(t, err)
+
 	return desired
 }
