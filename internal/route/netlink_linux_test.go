@@ -1,5 +1,6 @@
 //go:build linux
 
+//nolint:testpackage // White-box tests exercise private netlink injection and route conversion.
 package route
 
 import (

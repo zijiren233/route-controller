@@ -7,9 +7,9 @@ Route Controller 为不注册 Kubernetes Node 的独立控制面维护到 Cilium
 Linux 路由。它以 Static Pod 运行在每台控制面，只修改本机路由；工作节点继续运行
 Cilium，承担 PodCIDR 和 Service CIDR 的数据面转发。
 
-该方案适用于控制面与 worker 位于同一可路由内网、Cilium 使用 native routing，且
-控制面因 standalone Kubelet 没有 CNI 路由的场景。它消除了 API Server 到 Pod、
-Service、webhook 和 worker Kubelet 流量对 Konnectivity 的依赖。
+该方案适用于控制面与 worker 位于同一可路由内网，且控制面因 standalone Kubelet
+没有 CNI 路由的场景。Cilium 可以使用 native routing 或 tunnel 模式。该方案消除了
+API Server 到 Pod、Service、webhook 和 worker Kubelet 流量对 Konnectivity 的依赖。
 
 ## 架构
 
@@ -52,8 +52,11 @@ Service CIDR 需要路由，因为 ClusterIP 是虚拟地址，外部控制面�
 - 目标 CIDR 已存在其他 protocol 的路由时，整轮预检失败，不覆盖 Netplan、BGP 或人工路由。
 - PodCIDR 必须位于允许范围内且彼此不重叠；Pod、Service、router 三个总 CIDR 不能重叠。
 - CiliumNode InternalIP 必须匹配同名 Node InternalIP，health IP 必须位于该节点 PodCIDR。
-- 项目仅声明读取所需的 CiliumNode v2 字段，避免 Cilium 发行模块把 Kubernetes 0.30
-  客户端带入锁定 Kubernetes 1.28 的控制器；数据来自稳定的 CRD JSON 接口。
+- 项目仅声明读取所需的 CiliumNode v2 字段，避免 Cilium 发行模块引入另一套 Kubernetes
+  客户端依赖；数据来自稳定的 CRD JSON 接口。
+- informer 只 watch `kube-system` 中带 `k8s-app=cilium` 标签的 Pod，并在对象进入缓存前
+  分别投影 Node、Pod、CiliumNode；每类资源只保留自身路由规划和缓存一致性所需字段。
+  投影降低常驻内存和读取时的 DeepCopy 成本；Kubernetes API 仍会传输并解码完整资源。
 - controller-runtime 缓存完成首次同步前不会执行 reconcile；API 暂时不可用和进程退出时保留路由。
 - Kubernetes RBAC 只能把 Pod 权限限制到 `kube-system`；客户端 watch 额外带
   `k8s-app=cilium` label selector，RBAC 本身无法按 label 授权。
@@ -71,19 +74,21 @@ Service CIDR 需要路由，因为 ClusterIP 是虚拟地址，外部控制面�
 
 ## Cilium 前提
 
-关键 Helm 配置如下，具体键名应以正在运行的 Cilium 版本为准：
+Route Controller 不依赖特定的 Cilium routing mode。两种模式下都必须允许集群外流量
+使用 ClusterIP，具体键名应以正在运行的 Cilium 版本为准：
 
 ```yaml
-routingMode: native
-autoDirectNodeRoutes: true
-ipv4NativeRoutingCIDR: 10.0.0.0/10
 bpf:
   lbExternalClusterIP: true
 ```
 
-worker 必须开启 IPv4 forwarding，并能在二层或现有 underlay 中作为控制面到集群网络
-的下一跳。上线前确认 worker 防火墙允许控制面访问 PodCIDR、Service CIDR 和 Cilium
-health responder 端口。
+native routing 模式可使用 `autoDirectNodeRoutes` 或底层路由协议维护 worker 间 PodCIDR
+路由。VXLAN/Geneve tunnel 模式可以保留现有封装；控制面仍把每个 PodCIDR 发往其所属
+worker，跨 worker 的 Service 后端流量再由 Cilium 隧道承载。
+
+worker 必须开启 IPv4 forwarding，并能作为控制面到集群网络的下一跳。上线前确认
+worker 防火墙和 Cilium policy 允许控制面访问 PodCIDR、Service CIDR 和 Cilium health
+responder 端口，同时验证 Pod 返回控制面时没有被错误 masquerade。
 
 ## CLI
 

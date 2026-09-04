@@ -11,6 +11,7 @@ import (
 	"time"
 
 	ciliumv2 "github.com/zijiren233/route-controller/internal/apis/cilium/v2"
+	"github.com/zijiren233/route-controller/internal/kubecache"
 	"github.com/zijiren233/route-controller/internal/planner"
 	"github.com/zijiren233/route-controller/internal/probe"
 	"github.com/zijiren233/route-controller/internal/route"
@@ -19,11 +20,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-)
-
-const (
-	CiliumPodLabelKey   = "k8s-app"
-	CiliumPodLabelValue = "cilium"
 )
 
 var (
@@ -196,7 +192,7 @@ func (reconciler *Reconciler) readWorkers(ctx context.Context) ([]planner.Worker
 		ctx,
 		&pods,
 		client.InNamespace(metav1.NamespaceSystem),
-		client.MatchingLabels{CiliumPodLabelKey: CiliumPodLabelValue},
+		client.MatchingLabels{kubecache.CiliumPodLabelKey: kubecache.CiliumPodLabelValue},
 	); err != nil {
 		return nil, fmt.Errorf("list Cilium Pods from cache: %w", err)
 	}

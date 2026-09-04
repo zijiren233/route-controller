@@ -9,18 +9,14 @@ import (
 	ciliumv2 "github.com/zijiren233/route-controller/internal/apis/cilium/v2"
 	"github.com/zijiren233/route-controller/internal/config"
 	"github.com/zijiren233/route-controller/internal/controller"
+	"github.com/zijiren233/route-controller/internal/kubecache"
 	"github.com/zijiren233/route-controller/internal/planner"
 	"github.com/zijiren233/route-controller/internal/probe"
 	"github.com/zijiren233/route-controller/internal/route"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
@@ -61,17 +57,7 @@ func Run(ctx context.Context, cfg config.Validated) error {
 
 	manager, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: apiScheme,
-		Cache: cache.Options{
-			ReaderFailOnMissingInformer: true,
-			ByObject: map[client.Object]cache.ByObject{
-				&corev1.Pod{}: {
-					Namespaces: map[string]cache.Config{metav1.NamespaceSystem: {}},
-					Label: labels.SelectorFromSet(labels.Set{
-						controller.CiliumPodLabelKey: controller.CiliumPodLabelValue,
-					}),
-				},
-			},
-		},
+		Cache:  kubecache.Options(),
 		Metrics: metricsserver.Options{
 			BindAddress: cfg.Observability.MetricsBindAddress,
 			ExtraHandlers: map[string]http.Handler{
