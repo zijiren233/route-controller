@@ -10,7 +10,7 @@ spec:
   terminationGracePeriodSeconds: 15
   containers:
     - name: controller
-      image: ghcr.io/zijiren233/route-controller:latest
+      image: ghcr.io/zijiren233/route-controller:main
       imagePullPolicy: IfNotPresent
       args:
         - run

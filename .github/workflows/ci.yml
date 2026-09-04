@@ -67,7 +67,6 @@ jobs:
           -strict -summary
           /work/deploy/rbac/rbac.yaml
           /work/deploy/static-pod/image.yaml
-          /work/deploy/static-pod/host-binary.yaml
 
   build:
     runs-on: ubuntu-24.04

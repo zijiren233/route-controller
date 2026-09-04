@@ -154,19 +154,19 @@ Secret，并生成只连接本机 `https://127.0.0.1:6443` 的 kubeconfig；生�
 权限并建立 token 轮换流程。API Server 证书使用其他 DNS SAN 时，通过
 `ROUTE_CONTROLLER_TLS_SERVER_NAME` 设置校验名称。
 
-生产镜像清单位于 [deploy/static-pod/image.yaml](deploy/static-pod/image.yaml)。把配置和
-kubeconfig 放到 `/etc/kubernetes/route-controller/`，固定镜像 digest 后再将清单放到
-Kubelet static pod manifest 目录。
-
-离线环境可以复用节点已有的 sandbox 镜像并挂载 host binary：
+生产镜像清单位于 [deploy/static-pod/image.yaml](deploy/static-pod/image.yaml)。容器
+workflow 向 GHCR 发布分支标签和 `sha-<commit>` 标签；清单中的 `main` 仅用于展示，
+生产部署必须解析并固定 OCI image index digest：
 
 ```bash
-sudo deploy/scripts/install-host-binary.sh \
-  --binary ./bin/route-controller-linux-amd64 \
-  --config ./route-controller.yaml \
-  --sandbox-image '<existing-pause-image>' \
-  --mode dry-run
+ROUTE_CONTROLLER_IMAGE='ghcr.io/zijiren233/route-controller@sha256:<digest>'
+kubectl set image --local -f deploy/static-pod/image.yaml \
+  controller="${ROUTE_CONTROLLER_IMAGE}" -o yaml > route-controller.yaml
 ```
+
+把配置和 kubeconfig 放到 `/etc/kubernetes/route-controller/`，再将渲染后的清单原子
+安装到 Kubelet static pod manifest 目录。离线环境应把专属镜像及其 digest 同步到
+私有仓库。部署不依赖宿主机二进制或 sandbox 镜像。
 
 先检查 `/status` 中的 worker、PodCIDR、Service CIDR 和冲突结果，再逐台控制面切换
 `--mode active`。每台就绪后验证 PodIP、ClusterIP、API Server 的 logs、exec、
