@@ -29,8 +29,10 @@ func (systemNetwork) InterfaceFor(address netip.Addr) (string, error) {
 			indexes = append(indexes, route.LinkIndex)
 		}
 	}
+
 	slices.Sort(indexes)
 	indexes = slices.Compact(indexes)
+
 	if len(indexes) != 1 {
 		return "", fmt.Errorf("expected one output interface, found %d", len(indexes))
 	}
@@ -63,6 +65,7 @@ func (systemNetwork) ConnectedPrefixes(interfaceName string) ([]netip.Prefix, er
 		if route.Scope != netlink.SCOPE_LINK || route.Dst == nil {
 			continue
 		}
+
 		prefix, parseErr := netip.ParsePrefix(route.Dst.String())
 		if parseErr == nil && prefix.Addr().Is4() {
 			prefixes = append(prefixes, prefix.Masked())

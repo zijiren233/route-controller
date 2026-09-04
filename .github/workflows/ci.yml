@@ -58,9 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: ShellCheck
-        uses: ludeeus/action-shellcheck@2.0.0
-        with:
-          scandir: deploy/scripts
+        run: shellcheck -x deploy/scripts/*.sh
       - name: Validate shell syntax
         run: bash -n deploy/scripts/*.sh
       - name: Validate Kubernetes manifests
