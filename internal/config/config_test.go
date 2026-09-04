@@ -75,6 +75,7 @@ probe:
 
 func validConfig() config.Config {
 	cfg := config.Defaults()
+	cfg.Routes.Interface = "eth0"
 	cfg.Routes.PodCIDR = "10.0.0.0/10"
 	cfg.Routes.ServiceCIDR = "10.192.0.0/12"
 	cfg.Routes.RouterCIDR = "192.0.2.0/24"

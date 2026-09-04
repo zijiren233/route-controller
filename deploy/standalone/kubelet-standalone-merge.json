@@ -1,0 +1,12 @@
+{
+  "authentication": {
+    "webhook": {
+      "enabled": false
+    }
+  },
+  "authorization": {
+    "mode": "AlwaysAllow"
+  },
+  "registerNode": false,
+  "rotateCertificates": false
+}

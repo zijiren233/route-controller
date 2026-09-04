@@ -10,7 +10,7 @@ import (
 
 const (
 	DefaultKubeconfig             = "/etc/route-controller/kubeconfig"
-	DefaultInterface              = "eth0"
+	DefaultInterface              = ""
 	DefaultRouteTable             = 254
 	DefaultRouteProtocol          = 99
 	DefaultReconcilePeriod        = 10 * time.Second

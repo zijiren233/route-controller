@@ -9,6 +9,7 @@ import (
 	ciliumv2 "github.com/zijiren233/route-controller/internal/apis/cilium/v2"
 	"github.com/zijiren233/route-controller/internal/config"
 	"github.com/zijiren233/route-controller/internal/controller"
+	"github.com/zijiren233/route-controller/internal/discovery"
 	"github.com/zijiren233/route-controller/internal/kubecache"
 	"github.com/zijiren233/route-controller/internal/planner"
 	"github.com/zijiren233/route-controller/internal/probe"
@@ -17,21 +18,54 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 const userAgent = "route-controller"
 
-func Run(ctx context.Context, cfg config.Validated) error {
-	restConfig, err := clientcmd.BuildConfigFromFlags("", cfg.Kubernetes.Kubeconfig)
+func Run(ctx context.Context, loaded config.Config) error {
+	restConfig, err := clientcmd.BuildConfigFromFlags("", loaded.Kubernetes.Kubeconfig)
 	if err != nil {
 		return fmt.Errorf("load kubeconfig: %w", err)
 	}
 
 	restConfig.UserAgent = userAgent
-	restConfig.QPS = cfg.Kubernetes.QPS
-	restConfig.Burst = cfg.Kubernetes.Burst
+	restConfig.QPS = loaded.Kubernetes.QPS
+	restConfig.Burst = loaded.Kubernetes.Burst
+
+	apiScheme := runtime.NewScheme()
+	if err := scheme.AddToScheme(apiScheme); err != nil {
+		return fmt.Errorf("register Kubernetes API scheme: %w", err)
+	}
+
+	if err := ciliumv2.AddToScheme(apiScheme); err != nil {
+		return fmt.Errorf("register Cilium API scheme: %w", err)
+	}
+
+	apiReader, err := client.New(restConfig, client.Options{Scheme: apiScheme})
+	if err != nil {
+		return fmt.Errorf("create discovery client: %w", err)
+	}
+
+	cfg, err := discovery.NewResolver(apiReader, discovery.NewSystemNetwork()).Resolve(ctx, loaded)
+	if err != nil {
+		return fmt.Errorf("resolve route configuration: %w", err)
+	}
+
+	log.FromContext(ctx).Info(
+		"resolved route configuration",
+		"interface",
+		cfg.Routes.Interface,
+		"podCIDR",
+		cfg.PodCIDR,
+		"serviceCIDR",
+		cfg.ServiceCIDR,
+		"routerCIDR",
+		cfg.RouterCIDR,
+	)
 
 	backend, err := route.NewNetlinkBackend(
 		cfg.Routes.Interface,
@@ -42,15 +76,6 @@ func Run(ctx context.Context, cfg config.Validated) error {
 	)
 	if err != nil {
 		return err
-	}
-
-	apiScheme := runtime.NewScheme()
-	if err := scheme.AddToScheme(apiScheme); err != nil {
-		return fmt.Errorf("register Kubernetes API scheme: %w", err)
-	}
-
-	if err := ciliumv2.AddToScheme(apiScheme); err != nil {
-		return fmt.Errorf("register Cilium API scheme: %w", err)
 	}
 
 	status := controller.NewStatusStore(cfg.Controller.DryRun)

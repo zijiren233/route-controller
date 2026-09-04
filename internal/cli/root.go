@@ -17,7 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-type Runner func(context.Context, config.Validated) error
+type Runner func(context.Context, config.Config) error
 
 func NewRootCommand(runner Runner) *cobra.Command {
 	root := &cobra.Command{
@@ -58,12 +58,7 @@ func newRunCommand(runner Runner) *cobra.Command {
 			return err
 		}
 
-		validated, err := loaded.Validate()
-		if err != nil {
-			return err
-		}
-
-		logger, err := logging.New(validated.Logging)
+		logger, err := logging.New(loaded.Logging)
 		if err != nil {
 			return err
 		}
@@ -71,7 +66,7 @@ func newRunCommand(runner Runner) *cobra.Command {
 		ctrl.SetLogger(logger)
 		ctx := log.IntoContext(command.Context(), logger)
 
-		return runner(ctx, validated)
+		return runner(ctx, loaded)
 	}
 
 	return command

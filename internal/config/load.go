@@ -98,11 +98,15 @@ func addFlags(flags *pflag.FlagSet, values *viper.Viper) error {
 	flags.String(
 		"interface",
 		defaults.Routes.Interface,
-		"host interface used to reach worker next hops",
+		"host interface used to reach worker next hops (automatically discovered when empty)",
 	)
-	flags.String("pod-cidr", "", "allowed cluster Pod CIDR")
-	flags.String("service-cidr", "", "cluster Service CIDR")
-	flags.String("router-cidr", "", "allowed worker node IP CIDR")
+	flags.String("pod-cidr", "", "allowed cluster Pod CIDR (automatically discovered when empty)")
+	flags.String("service-cidr", "", "cluster Service CIDR (automatically discovered when empty)")
+	flags.String(
+		"router-cidr",
+		"",
+		"allowed worker node IP CIDR (automatically discovered when empty)",
+	)
 	flags.Int("route-table", defaults.Routes.Table, "Linux route table number")
 	flags.Int(
 		"route-protocol",

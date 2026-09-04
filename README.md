@@ -90,10 +90,23 @@ worker 必须开启 IPv4 forwarding，并能作为控制面到集群网络的下
 worker 防火墙和 Cilium policy 允许控制面访问 PodCIDR、Service CIDR 和 Cilium health
 responder 端口，同时验证 Pod 返回控制面时没有被错误 masquerade。
 
+关键内核值应满足：
+
+```text
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.cilium_*.rp_filter = 0
+```
+
+Node IP 所在接口的 `rp_filter` 使用 disabled `0` 或 loose mode `2`，不能使用 strict
+mode `1`。VXLAN 模式还需要加载 `vxlan` 内核模块，并允许 worker 之间双向 UDP/8473。
+部署脚本会通过 Cilium Agent 的主机网络命名空间检查 `ip_forward` 和全局
+`rp_filter`，接口级设置仍应纳入节点基线和上线验收。
+
 ## CLI
 
 ```bash
-route-controller run --config=/etc/route-controller/config.yaml
+route-controller run
 route-controller validate --config=./config.yaml
 route-controller validate --config=./config.yaml --output=yaml
 route-controller version --output=json
@@ -109,9 +122,20 @@ ROUTE_CONTROLLER_PROBE_FAILURE_THRESHOLD
 ROUTE_CONTROLLER_OBSERVABILITY_METRICS_BIND_ADDRESS
 ```
 
-完整配置见 [config/examples/route-controller.yaml](config/examples/route-controller.yaml)。
-`pod-cidr`、`service-cidr`、`router-cidr` 必填。`validate` 只校验并规范化配置，不访问
-Kubernetes 或修改路由。
+`run` 默认在启动时连接 API Server，并在内存中解析运行配置：
+
+- Pod CIDR：读取 `kube-system/cilium-config` 的 `cluster-pool-ipv4-cidr`，缺失时回退到
+  `kube-system/kubeadm-config` 的 `networking.podSubnet`。
+- Service CIDR：读取 `kube-system/kubeadm-config` 的 `networking.serviceSubnet`。
+- 出口接口：读取所有非控制面 Node 的 IPv4 `InternalIP`，通过本机内核路由逐一解析，
+  并要求全部 worker 使用同一接口。
+- worker 网段：在出口接口上选择包含所有 worker `InternalIP` 的最具体 IPv4 直连网段。
+
+自动发现不会创建配置文件。`--interface`、`--pod-cidr`、`--service-cidr` 和
+`--router-cidr` 可覆盖对应字段；完整覆盖示例见
+[config/examples/route-controller.yaml](config/examples/route-controller.yaml)。`validate` 是
+离线命令，因此要求配置包含完整路由字段，只校验和规范化配置，不访问 Kubernetes 或
+修改路由。
 
 默认可观测端点：
 
@@ -169,13 +193,75 @@ kubectl set image --local -f deploy/static-pod/image.yaml \
   controller="${ROUTE_CONTROLLER_IMAGE}" -o yaml > route-controller.yaml
 ```
 
-把配置和 kubeconfig 放到 `/etc/kubernetes/route-controller/`，再将渲染后的清单原子
+把 kubeconfig 放到 `/etc/kubernetes/route-controller/`，再将渲染后的清单原子
 安装到 Kubelet static pod manifest 目录。离线环境应把专属镜像及其 digest 同步到
 私有仓库。部署不依赖宿主机二进制或 sandbox 镜像。
 
 先检查 `/status` 中的 worker、PodCIDR、Service CIDR 和冲突结果，再逐台控制面切换
 `--mode active`。每台就绪后验证 PodIP、ClusterIP、API Server 的 logs、exec、
 port-forward 和 Service webhook，再处理下一台。
+
+## Standalone Kubelet 自动部署
+
+仓库提供只操作当前节点的部署和回滚脚本。运维人员需要登录每台控制面，先执行预检，
+再逐台人工确认切换；脚本自身不连接或编排其他节点：
+
+- `deploy/scripts/deploy-standalone.sh`：备份节点状态、创建 Route Controller RBAC 和
+  kubeconfig、生成 standalone Kubelet 配置、预拉取不可变镜像、删除 Node、清理旧
+  Cilium 主机数据面，最后部署 Route Controller Static Pod 并验证 ClusterIP。
+- `deploy/scripts/rollback-standalone.sh`：先停止 Route Controller 并保留受管路由，恢复
+  Kubelet 注册并等待 Node 和 Cilium Agent Ready，再清理 protocol 99 路由、本机配置
+  和 kubeconfig。共享 RBAC 仅在显式传入 `--delete-rbac` 时删除。
+
+Route Controller 启动后自动从本机 API Server 和内核路由获取配置，部署脚本不会生成、
+挂载或持久化 Route Controller 配置文件。默认使用 main route table `254`、route
+protocol `99` 和 active 模式。镜像参数必须是容器 workflow 发布的不可变 OCI digest。
+
+```bash
+ROUTE_CONTROLLER_IMAGE='ghcr.io/zijiren233/route-controller@sha256:<digest>'
+
+# 在当前控制面执行健康检查或部署预检；不会修改节点或 Kubernetes 资源。
+deploy/scripts/deploy-standalone.sh \
+  --check
+
+# 只转换当前控制面；成功后再人工登录下一台重复执行。
+deploy/scripts/deploy-standalone.sh \
+  --image "${ROUTE_CONTROLLER_IMAGE}" \
+  --yes
+```
+
+部署要求 Cilium 已启用 `bpf.lbExternalClusterIP=true`。未启用时，额外传入控制面上的
+Sealos Cilium chart 目录，脚本会保留现有 release values、只开启该参数并滚动 Agent：
+
+```bash
+deploy/scripts/deploy-standalone.sh \
+  --image "${ROUTE_CONTROLLER_IMAGE}" \
+  --cilium-chart /path/to/cilium-chart \
+  --yes
+```
+
+每台节点的原始 Kubelet 配置、Node 元数据、转换阶段和 Cilium 清理工具保存在
+`/var/lib/standalone-kubelet-manager/`。已有完整部署会直接执行健康检查；中途失败会
+保留当前 `phase` 和备份，使用回滚脚本恢复，不会覆盖初始备份。
+
+```bash
+# 验证当前节点的备份和 standalone 状态。
+deploy/scripts/rollback-standalone.sh --check
+
+# 只恢复当前控制面 Node；如果本节点曾修改 Cilium，传入同一 chart 路径。
+deploy/scripts/rollback-standalone.sh \
+  --cilium-chart /path/to/cilium-chart \
+  --yes
+```
+
+早期手工部署可以通过 `--legacy-backup-dir <local-path>` 使用当前节点上的旧备份目录。
+回滚默认保留其他控制面仍在使用的共享账号和 token；最后一台 Route Controller 完成
+回滚后，通过 `--delete-rbac` 显式删除共享 RBAC。
+
+脚本默认拒绝删除运行普通工作负载的控制面 Node，`--allow-workloads` 仅用于已经完成
+迁移确认的场景。它也会拒绝仍配置 `--egress-selector-config-file` 的 API Server；应先
+按照集群的通信方案验证并移除 EgressSelectorConfiguration 和 Konnectivity，再运行
+自动转换。脚本不会修改这些 API Server 和代理资源。
 
 ## 回滚
 

@@ -14,7 +14,6 @@ spec:
       imagePullPolicy: IfNotPresent
       args:
         - run
-        - --config=/etc/route-controller/config.yaml
       securityContext:
         runAsNonRoot: false
         runAsUser: 0
@@ -57,17 +56,10 @@ spec:
           cpu: 200m
           memory: 128Mi
       volumeMounts:
-        - name: config
-          mountPath: /etc/route-controller/config.yaml
-          readOnly: true
         - name: kubeconfig
           mountPath: /etc/route-controller/kubeconfig
           readOnly: true
   volumes:
-    - name: config
-      hostPath:
-        path: /etc/kubernetes/route-controller/config.yaml
-        type: File
     - name: kubeconfig
       hostPath:
         path: /etc/kubernetes/route-controller/kubeconfig
