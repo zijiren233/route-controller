@@ -23,6 +23,22 @@ func TestValidate(t *testing.T) {
 	assert.Equal(t, "192.0.2.0/24", validated.RouterCIDR.String())
 }
 
+func TestValidateNormalizesCIDRs(t *testing.T) {
+	t.Parallel()
+
+	cfg := validConfig()
+	cfg.Routes.PodCIDR = "10.0.1.1/16"
+	cfg.Routes.ServiceCIDR = "10.192.1.1/12"
+	cfg.Routes.RouterCIDR = "192.0.2.17/24"
+
+	validated, err := cfg.Validate()
+	require.NoError(t, err)
+
+	assert.Equal(t, "10.0.0.0/16", validated.Routes.PodCIDR)
+	assert.Equal(t, "10.192.0.0/12", validated.Routes.ServiceCIDR)
+	assert.Equal(t, "192.0.2.0/24", validated.Routes.RouterCIDR)
+}
+
 func TestValidateReportsAllImportantErrors(t *testing.T) {
 	t.Parallel()
 
