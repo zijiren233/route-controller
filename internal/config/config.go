@@ -152,6 +152,11 @@ func (cfg Config) Validate() (Validated, error) {
 		return Validated{}, fmt.Errorf("invalid configuration: %w", err)
 	}
 
+	// Keep the serializable configuration aligned with the parsed prefixes.
+	cfg.Routes.PodCIDR = podCIDR.String()
+	cfg.Routes.ServiceCIDR = serviceCIDR.String()
+	cfg.Routes.RouterCIDR = routerCIDR.String()
+
 	return Validated{
 		Config:      cfg,
 		PodCIDR:     podCIDR,
