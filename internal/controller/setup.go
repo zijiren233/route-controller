@@ -4,6 +4,7 @@ import (
 	"context"
 
 	ciliumv2 "github.com/zijiren233/route-controller/internal/apis/cilium/v2"
+	"github.com/zijiren233/route-controller/internal/kubecache"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -26,6 +27,7 @@ func (reconciler *Reconciler) SetupWithManager(manager ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(manager).
 		Named(controllerName).
+		WithEventFilter(kubecache.RouteChanges()).
 		Watches(&corev1.Node{}, enqueueSingleton).
 		Watches(&corev1.Pod{}, enqueueSingleton).
 		Watches(&ciliumv2.CiliumNode{}, enqueueSingleton).

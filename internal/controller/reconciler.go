@@ -33,7 +33,7 @@ type ReconcilerConfig struct {
 }
 
 type Reconciler struct {
-	client  client.Client
+	client  client.Reader
 	planner *planner.Planner
 	backend route.Backend
 	prober  probe.Prober
@@ -44,7 +44,7 @@ type Reconciler struct {
 }
 
 func NewReconciler(
-	apiClient client.Client,
+	apiClient client.Reader,
 	routePlanner *planner.Planner,
 	backend route.Backend,
 	prober probe.Prober,
