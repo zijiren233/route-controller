@@ -57,6 +57,10 @@ Service CIDR 需要路由，因为 ClusterIP 是虚拟地址，外部控制面�
 - informer 只 watch `kube-system` 中带 `k8s-app=cilium` 标签的 Pod，并在对象进入缓存前
   分别投影 Node、Pod、CiliumNode；每类资源只保留自身路由规划和缓存一致性所需字段。
   投影降低常驻内存和读取时的 DeepCopy 成本；Kubernetes API 仍会传输并解码完整资源。
+- Update 事件只比较投影后的路由字段，忽略 resourceVersion、心跳时间及无关元数据变化。
+  Ready、InternalIP、PodCIDR、health IP、Pod 绑定及删除状态变化仍立即入队；创建和删除
+  事件始终保留。周期收敛使用 `RequeueAfter`，持续检查外部路由漂移和主动探针，
+  不依赖 informer resync。事件过滤不会减少 API watch 流量或阻止缓存更新。
 - controller-runtime 缓存完成首次同步前不会执行 reconcile；API 暂时不可用和进程退出时保留路由。
 - Kubernetes RBAC 只能把 Pod 权限限制到 `kube-system`；客户端 watch 额外带
   `k8s-app=cilium` label selector，RBAC 本身无法按 label 授权。
