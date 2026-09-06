@@ -64,3 +64,35 @@ The annotation experiment demonstrates about 95% fewer reconciliations for that
 specific event workload. It does not establish a general CPU/memory percentage or
 a large-cluster throughput claim. Watch traffic, cache population, and global
 planning complexity are unchanged. The test deployment is temporary, not a release.
+
+## GitHub Actions image deployment
+
+The subsequent validation on September 7 used the image published by
+[GitHub Actions run 34048497746](https://github.com/zijiren233/route-controller/actions/runs/34048497746)
+for commit `ae900f918602c1f99a10f8c12d2d7987fbd4a171`. Both architecture builds
+and the final image publication succeeded.
+
+Image: `ghcr.io/zijiren233/route-controller:sha-ae900f9`
+
+Pinned OCI index digest:
+`sha256:bd6ba8bb4bf422328eef6975af078a7146fc4f0d225b685606c30e2ac3c877d1`.
+
+All three test control planes pulled that digest and were updated sequentially.
+The running container on each reported the exact commit above and `linux/amd64`.
+Every node passed the complete test sequence:
+
+| Check | Control plane 1 | Control plane 2 | Control plane 3 |
+| --- | --- | --- | --- |
+| Reconciliations for 20 annotation updates | 1 in 9 seconds | 1 in 9 seconds | 1 in 10 seconds |
+| Watched field withdrawal / restoration | <1s / <1s | 1s / <1s | <1s / <1s |
+| Probe failure withdrawal | 31s | 30s | 31s |
+| Probe recovery and periodic route repair | Passed | Passed | Passed |
+| Privileged netlink lifecycle | Passed | Passed | Passed |
+| PodIP / ClusterIP / API Service | 307 / 307 / 200 | 307 / 307 / 200 | 307 / 307 / 200 |
+| Logs / exec / port-forward | Passed | Passed | Passed |
+
+The final state retains the Actions image on all three nodes, each ready with
+three owned routes and two healthy workers. Cilium is 2/2. Injected health changes,
+test annotations, and firewall rules were removed. Original manifests were backed
+up before each update for rollback. This supersedes the temporary local-image
+deployment described above; arm64 was built by Actions but not deployed here.
