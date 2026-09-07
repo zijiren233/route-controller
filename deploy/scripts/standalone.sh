@@ -91,7 +91,9 @@ allow_workloads=0
 while (($#)); do
 	case $1 in
 	--admin-kubeconfig | --kubeconfig | --output | --api-server | --state-dir | --node-name | --timeout | --image | --tls-server-name | --legacy-backup-dir)
-		(($# >= 2)) && [[ -n $2 && $2 != --* ]] || die "missing value for $1"
+		if (($# < 2)) || [[ -z $2 || $2 == --* ]]; then
+			die "missing value for $1"
+		fi
 		;;
 	esac
 	case $1 in
