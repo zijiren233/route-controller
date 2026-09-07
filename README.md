@@ -207,14 +207,14 @@ port-forward 和 Service webhook，再处理下一台。
 
 ## Standalone Kubelet 自动部署
 
-统一入口为 `deploy/scripts/standalone.sh`。部署和回滚只修改当前节点文件，使用重启
-清空内核中的旧 Cilium/Controller 路由与 BPF 状态，不需要目标节点上的 admin kubeconfig。
+统一入口为 `deploy/scripts/standalone.sh`。部署通过重启清空旧 Cilium 路由与 BPF 状态；
+回滚在线停止 Controller、清理受管路由并恢复 kubelet，无需重启。两者均不需要目标节点上的 admin kubeconfig。
 
 | 命令 | 作用 |
 | --- | --- |
 | `deploy` | 导入 Controller 凭据、预拉镜像、备份文件、停止 kubelet、写入配置 |
-| `check` | 重启后检查本机 kubelet、Controller、CRI 和受管路由 |
-| `rollback` | 停止 kubelet并恢复部署前文件，不访问 Kubernetes API |
+| `check` | 检查本机 kubelet、Controller、CRI 和受管路由 |
+| `rollback` | 停止 kubelet/Controller、清理路由、恢复文件并启动 kubelet，不访问 Kubernetes API |
 | `kubeconfig` | 导入或复用凭据；也可在管理机器上通过 admin 生成凭据 |
 
 ```bash
@@ -229,8 +229,7 @@ deploy/scripts/standalone.sh check
 
 # 无 admin、无 API 连接也可恢复本机文件。
 deploy/scripts/standalone.sh rollback --check
-deploy/scripts/standalone.sh rollback --yes --reboot
-# 重连节点后：
+deploy/scripts/standalone.sh rollback --yes
 deploy/scripts/standalone.sh check
 ```
 
@@ -239,11 +238,21 @@ deploy/scripts/standalone.sh check
 导入通过 `kubectl config view --raw --flatten --minify` 内嵌证书，不发起 API 请求。
 不支持 exec/auth-provider/tokenFile；目标文件权限为 `0600`。
 
-默认只准备文件并停止 kubelet，需要手动 `systemctl reboot`；`--reboot` 自动请求重启。
+部署默认只准备文件并停止 kubelet，需要手动 `systemctl reboot`；`--reboot` 自动请求重启。
 不要在准备文件后、重启前重新启动 kubelet。重启清空内核状态，持久化 Cilium/CNI 文件
 保留。脚本不调用 cilium-dbg、不更改 Cilium/Helm/sysctl，也不删除 Node、Lease 或 RBAC。
 因此保留的 Node 最终会显示 NotReady，部分 Pod API 对象可能陈旧；可由管理员另行处理。
 保留 Node 可让回滚沿用原标签、污点；脚本不会重新创建被外部删除的 Node 元数据。
+
+Standalone kubelet 设置 `enableServer: false`、`enableDebuggingHandlers: false`、
+`readOnlyPort: 0` 和 `healthzPort: 0`，关闭其 HTTP/HTTPS 监听。`check` 通过 systemd
+确认 kubelet 运行，并检查 Controller 就绪状态，不再访问 kubelet healthz。
+
+回滚依次执行 `systemctl stop kubelet`、`crictl stop` 停止本项目 Controller 容器、
+`ip -4 route flush table 254 proto 99`，恢复文件后执行 `systemctl daemon-reload`
+和 `systemctl start kubelet`。停止 Controller 成功后才清理路由，避免路由被重新创建。
+其他 Static Pod 保持运行。`table 254 proto 99` 须专用于本项目部署；回滚仍可选择
+`--reboot`，此时恢复文件后通过重启启动 kubelet。
 
 操作前自行迁移业务，配置 Cilium external ClusterIP 和 worker 转发/rp_filter，验证并
 处理 EgressSelector/Konnectivity。脚本不再检查集群业务负载或 Cilium DaemonSet 收敛。
@@ -252,8 +261,8 @@ ClusterIP、logs、exec、port-forward，再操作下一台。回滚后另行确
 
 原始配置 `/var/lib/kubelet/config.yaml` 不变。新增的 standalone 配置、systemd drop-in、
 Controller 清单及凭据记录在 `/var/lib/standalone-kubelet-manager/backup` 中；
-回滚恢复部署前存在的文件，移除新建文件。重启后的 `check` 是只读操作，使用 boot ID
-确认已经重启。中途失败保留备份，使用 `rollback` 恢复。已有部署不会被当作镜像升级。
+回滚恢复部署前存在的文件，移除新建文件。`check` 是只读操作，仅对需要重启的操作
+使用 boot ID 确认已经重启。中途失败保留备份，使用 `rollback` 恢复。已有部署不会被当作镜像升级。
 回滚后保留备份；再次部署需移走旧状态目录或指定新 `--state-dir`。
 旧版在线转换产生的备份需先使用旧版脚本回滚，再采用本流程。
 

@@ -1,4 +1,8 @@
 {
+  "enableServer": false,
+  "enableDebuggingHandlers": false,
+  "readOnlyPort": 0,
+  "healthzPort": 0,
   "authentication": {
     "webhook": {
       "enabled": false

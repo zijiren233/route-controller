@@ -26,8 +26,8 @@ Usage: deploy/scripts/standalone.sh COMMAND [options]
 
 Commands:
   deploy       Back up local files, stage standalone kubelet and Static Pod.
-  rollback     Restore local files saved by this reboot-based deployer.
-  check        Check local kubelet/Controller after reboot; no admin required.
+  rollback     Stop Controller, clear its routes, restore files, start kubelet.
+  check        Check local kubelet/Controller after deploy or rollback.
   kubeconfig   Import/reuse Controller credentials, or generate via admin.
 
 Common options:
@@ -38,8 +38,8 @@ Common options:
   -h, --help              Show help without root, dependencies, or API access.
 Deploy / rollback:
   --image IMAGE@sha256:... Required for deploy. Use a successful Actions digest.
-  --reboot                Request systemctl reboot after staging.
-                          Otherwise reboot manually before running check.
+  --reboot                Deploy: reboot after staging, otherwise reboot manually.
+                          Rollback: optional reboot instead of starting kubelet.
   --check                 Read-only local input/backup check, not cluster health.
 Kubeconfig only:
   --admin-kubeconfig FILE  Used ONLY when generating; never needed for import.
@@ -89,17 +89,22 @@ ARRANGE THESE PREREQUISITES YOURSELF
   are untouched. No cilium-dbg is copied or executed. Reboot clears kernel
   BPF/interfaces/routes; persistent Cilium/CNI files remain. Standalone Static
   Pods use host networking. Verify Cilium does not run again on this node.
+  Standalone kubelet disables HTTPS, read-only HTTP, health HTTP, and debugging
+  handlers. Local health checks use systemd and Controller readiness.
+  Table 254 protocol 99 is reserved for this deployment; rollback flushes it.
   Tools: root, bash, kubectl, jq, systemctl, crictl, flock, curl, ip, coreutils.
   check verifies local health/routes; verify PodIP, ClusterIP, logs, exec, and
   port-forward before converting the next node.
 
-ROLLBACK: NO API CONNECTIVITY OR ADMIN REQUIRED
+ROLLBACK: NO REBOOT, API CONNECTIVITY, OR ADMIN REQUIRED
   sudo deploy/scripts/standalone.sh rollback --check
-  sudo deploy/scripts/standalone.sh rollback --yes --reboot
-  # Reconnect after reboot:
+  sudo deploy/scripts/standalone.sh rollback --yes
   sudo deploy/scripts/standalone.sh check
-  Original kubelet credentials/configuration rejoin the retained Node. Reboot
-  clears Controller kernel routes. Confirm Node and Cilium recovery separately.
+  Stop kubelet, stop the Controller CRI container, flush IPv4 table 254 proto 99,
+  restore files, daemon-reload, then start kubelet. Controller must stop before
+  clearing routes so it cannot recreate them. Other Static Pods keep running.
+  Original kubelet credentials/configuration rejoin the retained Node.
+  Confirm Node and Cilium recovery separately. --reboot remains optional.
   Pre-existing files are restored; newly created files removed; RBAC untouched.
   Keep the same --state-dir. Old live-conversion backups require that older
   script's rollback first: that version deleted Node metadata.
@@ -128,8 +133,8 @@ FILES / STATUS
   /etc/kubernetes/manifests/route-controller.yaml       Static Pod
   /etc/kubernetes/route-controller/kubeconfig           Credentials
   STATE/backup, STATE/owner, STATE/phase, STATE/boot-id  Local recovery state
-  A staged operation is complete only after reboot and a successful check.
-  check is read-only and verifies the boot ID changed since staging.
+  Deploy requires reboot and a successful check. Default rollback starts
+  kubelet immediately. check verifies boot ID only for operations using reboot.
   Exit 0 means success; nonzero means failure. Errors retain backups; no
   automatic rollback or automatic kubelet restart is performed.
 EOF
@@ -429,23 +434,41 @@ rollback() {
 	cat /proc/sys/kernel/random/boot_id >"$state_dir/boot-id"
 	write_phase staging-rollback
 	systemctl stop kubelet
+	# Stopping kubelet alone leaves its containers running and routes reconciling.
+	local containers container
+	containers=$(crictl ps -o json | jq -er '[.containers[] |
+        select(.metadata.name == "controller" and
+            .labels["io.kubernetes.pod.namespace"] == "kube-system" and
+            (.labels["io.kubernetes.pod.name"] // "" | startswith("route-controller-"))) |
+        .id] | join("\n")')
+	while IFS= read -r container; do
+		[[ -z $container ]] || crictl stop "$container" >/dev/null
+	done <<<"$containers"
+	ip -4 route flush table 254 proto 99
 	restore_files
-	write_phase pending-rollback-reboot
-	finish_staging
+	if ((reboot)); then
+		write_phase pending-rollback-reboot
+		finish_staging
+	else
+		systemctl daemon-reload
+		systemctl start kubelet
+		write_phase rolled-back
+		log "files restored and kubelet started; verify Node/Cilium recovery"
+	fi
 }
 check() {
 	check_owner
 	local current_phase running_cilium
 	current_phase=$(phase)
 	case $current_phase in
-	pending-deploy-reboot | pending-rollback-reboot) ;;
+	pending-deploy-reboot | pending-rollback-reboot)
+		[[ $(<"$state_dir/boot-id") != "$(</proc/sys/kernel/random/boot_id)" ]] ||
+			die "node has not rebooted since staging"
+		;;
+	rolled-back) ;;
 	*) die "incomplete staging ($current_phase); use rollback" ;;
 	esac
-	[[ $(<"$state_dir/boot-id") != "$(</proc/sys/kernel/random/boot_id)" ]] ||
-		die "node has not rebooted since staging"
 	systemctl is-active --quiet kubelet || die "kubelet is not active"
-	curl -fsS --max-time 5 http://127.0.0.1:10248/healthz >/dev/null ||
-		die "kubelet is not healthy"
 	if [[ $current_phase == pending-deploy-reboot ]]; then
 		[[ -f $KUBELET_DROPIN && -f $ROUTE_MANIFEST && -f $ROUTE_KUBECONFIG ]] ||
 			die "standalone files are missing"
@@ -456,7 +479,7 @@ check() {
 		[[ -n $(ip -4 route show table 254 proto 99) ]] || die "managed routes are missing"
 		log "standalone kubelet and Controller are healthy after reboot"
 	else
-		log "restored kubelet is healthy after reboot; verify Node/Cilium recovery"
+		log "restored kubelet is active; verify Node/Cilium recovery"
 	fi
 }
 case $action in
@@ -465,7 +488,7 @@ deploy)
 	if ((check_only)); then check_deploy_inputs; else deploy; fi
 	;;
 rollback)
-	for command_name in systemctl flock; do require_command "$command_name"; done
+	for command_name in systemctl flock crictl jq ip; do require_command "$command_name"; done
 	if ((check_only)); then check_rollback_inputs; else rollback; fi
 	;;
 check)
