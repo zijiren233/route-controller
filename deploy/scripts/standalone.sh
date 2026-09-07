@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly PROGRAM_NAME=standalone-kubelet-node
+readonly PROGRAM_NAME=standalone-kubelet
 readonly KUBELET_CONFIG=/var/lib/kubelet/config.yaml
 readonly STANDALONE_CONFIG=/var/lib/kubelet/standalone-config.yaml
 readonly KUBELET_DROPIN=/etc/systemd/system/kubelet.service.d/20-standalone.conf
@@ -10,8 +10,6 @@ readonly ROUTE_CONFIG_DIR=/etc/kubernetes/route-controller
 readonly ROUTE_MANIFEST=/etc/kubernetes/manifests/route-controller.yaml
 readonly ROUTE_KUBECONFIG=${ROUTE_CONFIG_DIR}/kubeconfig
 readonly ROUTE_PROTOCOL=99
-readonly ADMIN_KUBECONFIG=/etc/kubernetes/admin.conf
-export KUBECONFIG=${ADMIN_KUBECONFIG}
 
 log() {
 	printf '[%s] %s\n' "${PROGRAM_NAME}" "$*"
@@ -28,7 +26,38 @@ require_command() {
 
 usage() {
 	cat <<'EOF'
-Internal node executor. Use deploy-standalone.sh or rollback-standalone.sh.
+Usage: deploy/scripts/standalone.sh COMMAND [options]
+
+Commands:
+  deploy       Convert the current node and install the Static Pod.
+  check        Read-only deployment preflight or installed-node health check.
+  rollback     Restore node registration; preserve shared RBAC by default.
+  kubeconfig   Import, reuse, or generate the Controller kubeconfig.
+
+Options:
+  --admin-kubeconfig FILE  Management credentials (otherwise KUBECONFIG,
+                           /etc/kubernetes/admin.conf, then ~/.kube/config).
+  --kubeconfig FILE        Import Controller credentials with embedded certs.
+                           Otherwise reuse the destination, or generate via admin.
+  --output FILE            Destination for the kubeconfig command only.
+  --api-server URL         Generated endpoint (default from admin kubeconfig).
+  --tls-server-name NAME   Generated TLS name (default from admin kubeconfig).
+  --image IMAGE@sha256:... Immutable workflow image; required for deploy.
+  --node-name NAME         Current node name (default hostname).
+  --state-dir PATH         Persistent backup directory.
+  --legacy-backup-dir PATH Legacy rollback backup.
+  --timeout SECONDS        Convergence timeout (default 300).
+  --skip-cilium-cleanup    Only for nodes with Cilium host state already cleaned.
+  --allow-workloads        Permit conversion with ordinary workloads present.
+  --delete-rbac            Remove shared RBAC after the final rollback.
+  --check                  Read-only preflight for deploy or rollback.
+  --yes                    Confirm changes without prompting.
+  -h, --help               Show help.
+
+Run as root on each target node. Cilium configuration is never modified.
+Node conversion/rollback requires management credentials even when Controller
+credentials are supplied. Generated credentials use a dedicated ServiceAccount.
+Existing complete deployments are checked only; deploy does not upgrade images.
 EOF
 }
 
@@ -39,22 +68,66 @@ action=${1:-}
 }
 shift
 
+project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+readonly project_dir
 bundle_dir=
+temporary_dir=
+admin_kubeconfig=
+controller_kubeconfig=
+output_path=${ROUTE_KUBECONFIG}
+api_server=
+assume_yes=0
+check_only=0
+remove_rbac=0
 state_dir=/var/lib/standalone-kubelet-manager
 node_name=$(hostname)
 timeout=300
 route_image=
-tls_server_name=apiserver.cluster.local
+tls_server_name=
 legacy_backup_dir=
-cilium_chart=
 skip_cilium_cleanup=0
 allow_workloads=0
 
 while (($#)); do
 	case $1 in
-	--bundle-dir)
-		bundle_dir=$2
+	--admin-kubeconfig | --kubeconfig | --output | --api-server | --state-dir | --node-name | --timeout | --image | --tls-server-name | --legacy-backup-dir)
+		if (($# < 2)) || [[ -z $2 || $2 == --* ]]; then
+			die "missing value for $1"
+		fi
+		;;
+	esac
+	case $1 in
+	--admin-kubeconfig)
+		admin_kubeconfig=$2
 		shift 2
+		;;
+	--kubeconfig)
+		controller_kubeconfig=$2
+		shift 2
+		;;
+	--output)
+		output_path=$2
+		shift 2
+		;;
+	--api-server)
+		api_server=$2
+		shift 2
+		;;
+	--yes)
+		assume_yes=1
+		shift
+		;;
+	--check)
+		check_only=1
+		shift
+		;;
+	--delete-rbac)
+		remove_rbac=1
+		shift
+		;;
+	-h | --help)
+		usage
+		exit 0
 		;;
 	--state-dir)
 		state_dir=$2
@@ -80,10 +153,6 @@ while (($#)); do
 		legacy_backup_dir=$2
 		shift 2
 		;;
-	--cilium-chart)
-		cilium_chart=$2
-		shift 2
-		;;
 	--skip-cilium-cleanup)
 		skip_cilium_cleanup=1
 		shift
@@ -98,6 +167,18 @@ while (($#)); do
 	esac
 done
 
+case $action in
+-h | --help)
+	usage
+	exit 0
+	;;
+deploy | check | rollback | kubeconfig) ;;
+*) die "unknown command: ${action}" ;;
+esac
+[[ $output_path == /* ]] || die "--output must be absolute"
+[[ $action == kubeconfig || $output_path == "$ROUTE_KUBECONFIG" ]] ||
+	die "--output is only supported by kubeconfig"
+[[ -z $legacy_backup_dir || $legacy_backup_dir == /* ]] || die "legacy backup directory must be absolute"
 [[ $EUID -eq 0 ]] || die "must run as root"
 [[ $state_dir == /* ]] || die "state directory must be absolute"
 [[ $timeout =~ ^[1-9][0-9]*$ ]] || die "timeout must be a positive integer"
@@ -147,7 +228,9 @@ route_controller_ready() {
 }
 
 node_absent() {
-	! kubectl get node "${node_name}" >/dev/null 2>&1
+	local result
+	result=$(kubectl get node "${node_name}" --ignore-not-found -o name) || return 1
+	[[ -z $result ]]
 }
 
 node_ready() {
@@ -231,9 +314,7 @@ check_cluster() {
 	external=$(kubectl -n kube-system get configmap cilium-config \
 		-o jsonpath='{.data.bpf-lb-external-clusterip}')
 	if [[ $external != true ]]; then
-		[[ -n $cilium_chart && -d $cilium_chart ]] ||
-			die "Cilium bpf.lbExternalClusterIP must be true or --cilium-chart must be provided"
-		log "Cilium external ClusterIP handling will be enabled from ${cilium_chart}"
+		die "Cilium bpf.lbExternalClusterIP must already be true; configure Cilium before deployment"
 	fi
 	while IFS= read -r pod; do
 		[[ -n $pod ]] || continue
@@ -245,45 +326,6 @@ check_cluster() {
 		[[ $value == 0 ]] || die "${pod}: net.ipv4.conf.all.rp_filter must be 0"
 	done < <(kubectl -n kube-system get pods -l k8s-app=cilium -o name)
 	log "cluster API, Cilium readiness, external ClusterIP, and worker sysctls are valid"
-}
-
-configure_cilium() {
-	require_command helm
-	require_command kubectl
-	[[ -n $cilium_chart && -d $cilium_chart ]] || die "Cilium chart directory does not exist: ${cilium_chart}"
-	install -d -m 700 "${state_dir}/cluster"
-	if [[ ! -f ${state_dir}/cluster/cilium-user-values.yaml ]]; then
-		helm -n kube-system get values cilium -o yaml >"${state_dir}/cluster/cilium-user-values.yaml"
-	fi
-	if [[ $(kubectl -n kube-system get configmap cilium-config \
-		-o jsonpath='{.data.bpf-lb-external-clusterip}') == true ]]; then
-		log "Cilium external ClusterIP handling is already enabled"
-		return
-	fi
-	touch "${state_dir}/cluster/cilium-changed"
-	helm upgrade cilium "${cilium_chart}" -n kube-system --reuse-values \
-		--set bpf.lbExternalClusterIP=true --wait --timeout "${timeout}s"
-	kubectl -n kube-system rollout restart daemonset/cilium
-	kubectl -n kube-system rollout status daemonset/cilium --timeout "${timeout}s"
-	log "enabled Cilium external ClusterIP handling"
-}
-
-rollback_cilium() {
-	if [[ ! -f ${state_dir}/cluster/cilium-changed ]]; then
-		log "Cilium values were not changed by this deployment"
-		return
-	fi
-	require_command helm
-	require_command kubectl
-	[[ -n $cilium_chart && -d $cilium_chart ]] ||
-		die "--cilium-chart is required to restore the saved Cilium values"
-	[[ -f ${state_dir}/cluster/cilium-user-values.yaml ]] || die "saved Cilium values are missing"
-	helm upgrade cilium "${cilium_chart}" -n kube-system --reset-values \
-		-f "${state_dir}/cluster/cilium-user-values.yaml" --wait --timeout "${timeout}s"
-	kubectl -n kube-system rollout restart daemonset/cilium
-	kubectl -n kube-system rollout status daemonset/cilium --timeout "${timeout}s"
-	rm -f -- "${state_dir}/cluster/cilium-changed"
-	log "restored Cilium values saved before deployment"
 }
 
 check_unmanaged_workloads() {
@@ -345,24 +387,73 @@ stage_cilium_cleanup_tool() {
 	chmod 700 "${state_dir}/cilium-dbg"
 }
 
+validate_route_kubeconfig() {
+	local config=$1 verb resource config_map
+	for resource in nodes ciliumnodes.cilium.io; do
+		for verb in list watch; do
+			kubectl --kubeconfig="$config" auth can-i "$verb" "$resource" | grep -qx yes ||
+				die "Controller kubeconfig cannot $verb $resource"
+		done
+	done
+	for verb in list watch; do
+		kubectl --kubeconfig="$config" auth can-i "$verb" pods -n kube-system | grep -qx yes ||
+			die "Controller kubeconfig cannot $verb Cilium Pods"
+	done
+	for config_map in cilium-config kubeadm-config; do
+		kubectl --kubeconfig="$config" auth can-i get "configmap/$config_map" -n kube-system | grep -qx yes ||
+			die "Controller kubeconfig cannot read $config_map"
+	done
+}
+
 create_route_kubeconfig() {
-	local secret_data token_base64 ca_base64 route_token temporary_dir deadline
+	local source=$controller_kubeconfig
+	if [[ -z $source && -f $output_path ]]; then
+		log "reusing existing Controller kubeconfig"
+		source=$output_path
+	fi
+	if [[ -n $source ]]; then
+		[[ -f $source ]] || die "Controller kubeconfig does not exist"
+		temporary_dir=$(mktemp -d)
+		kubectl --kubeconfig="$source" config view --raw --flatten --minify -o json >"$temporary_dir/config"
+		jq -e '(.users | length) == 1 and
+            all(.users[].user; .exec == null and ."auth-provider" == null and .tokenFile == null)' \
+			"$temporary_dir/config" >/dev/null ||
+			die "Controller kubeconfig must contain portable credentials (no exec, auth-provider, or tokenFile)"
+		validate_route_kubeconfig "$temporary_dir/config"
+		mkdir -p "$(dirname -- "$output_path")"
+		install -m 600 "$temporary_dir/config" "$output_path"
+		rm -rf -- "$temporary_dir"
+		temporary_dir=
+		log "imported Controller kubeconfig"
+		return
+	fi
+	require_admin
+	generate_route_kubeconfig
+}
+
+generate_route_kubeconfig() {
+	local secret_data token_base64 ca_base64 route_token deadline
+	local cluster_config
+	cluster_config=$(kubectl config view --minify -o json)
+	[[ -n $api_server ]] || api_server=$(jq -er '.clusters[0].cluster.server' <<<"$cluster_config")
+	[[ -n $tls_server_name ]] || tls_server_name=$(jq -r '.clusters[0].cluster["tls-server-name"] // ""' <<<"$cluster_config")
 	kubectl apply -f "${bundle_dir}/deploy/route-controller-rbac.yaml"
 	deadline=$((SECONDS + timeout))
-	secret_data=
-	until [[ -n $secret_data ]]; do
+	token_base64=
+	ca_base64=
+	until [[ -n $token_base64 && -n $ca_base64 ]]; do
 		((SECONDS < deadline)) || die "timed out waiting for Route Controller token"
 		secret_data=$(kubectl -n kube-system get secret route-controller-token \
 			-o jsonpath='{.data.token}{" "}{.data.ca\.crt}' 2>/dev/null || true)
-		sleep 1
+		read -r token_base64 ca_base64 <<<"${secret_data}" || true
+		[[ -n $token_base64 && -n $ca_base64 ]] || sleep 1
 	done
-	read -r token_base64 ca_base64 <<<"${secret_data}"
 	[[ -n $token_base64 && -n $ca_base64 ]] || die "Route Controller token Secret is incomplete"
-	temporary_dir=$(mktemp -d "${state_dir}/kubeconfig.XXXXXX")
+	temporary_dir=$(mktemp -d)
 	printf '%s' "${ca_base64}" | base64 --decode >"${temporary_dir}/ca.crt"
 	route_token=$(printf '%s' "${token_base64}" | base64 --decode)
 	kubectl config --kubeconfig="${temporary_dir}/kubeconfig" set-cluster local-apiserver \
-		--server=https://127.0.0.1:6443 \
+		--server="${api_server}" \
 		--tls-server-name="${tls_server_name}" \
 		--certificate-authority="${temporary_dir}/ca.crt" \
 		--embed-certs=true >/dev/null
@@ -371,22 +462,13 @@ create_route_kubeconfig() {
 	kubectl config --kubeconfig="${temporary_dir}/kubeconfig" set-context route-controller \
 		--cluster=local-apiserver --user=route-controller >/dev/null
 	kubectl config --kubeconfig="${temporary_dir}/kubeconfig" use-context route-controller >/dev/null
-	install -d -m 700 "${ROUTE_CONFIG_DIR}"
-	install -m 600 "${temporary_dir}/kubeconfig" "${ROUTE_KUBECONFIG}"
+	validate_route_kubeconfig "${temporary_dir}/kubeconfig"
+	mkdir -p "$(dirname -- "$output_path")"
+	install -m 600 "${temporary_dir}/kubeconfig" "$output_path"
 	rm -rf -- "${temporary_dir}"
-	kubectl --kubeconfig="${ROUTE_KUBECONFIG}" auth can-i list nodes 2>/dev/null | grep -qx yes ||
-		die "Route Controller kubeconfig failed RBAC validation"
-	kubectl --kubeconfig="${ROUTE_KUBECONFIG}" auth can-i list ciliumnodes.cilium.io 2>/dev/null |
-		grep -qx yes ||
-		die "Route Controller kubeconfig cannot list CiliumNode resources"
-	kubectl --kubeconfig="${ROUTE_KUBECONFIG}" auth can-i list pods -n kube-system 2>/dev/null |
-		grep -qx yes ||
-		die "Route Controller kubeconfig cannot list Cilium Pods"
-	for config_map in cilium-config kubeadm-config; do
-		kubectl --kubeconfig="${ROUTE_KUBECONFIG}" auth can-i \
-			get "configmap/${config_map}" -n kube-system 2>/dev/null | grep -qx yes ||
-			die "Route Controller kubeconfig cannot get ConfigMap ${config_map}"
-	done
+	temporary_dir=
+	log "generated Controller kubeconfig"
+
 }
 
 generate_files() {
@@ -419,10 +501,18 @@ preflight_install() {
 		require_command "${command_name}"
 	done
 	[[ -n $bundle_dir && -d $bundle_dir ]] || die "bundle directory is missing"
-	[[ -f /etc/kubernetes/admin.conf && -f $KUBELET_CONFIG ]] ||
-		die "Kubernetes admin or Kubelet config is missing"
+	[[ -f $KUBELET_CONFIG ]] ||
+		die "Kubelet config is missing"
 	kubelet_healthy || die "kubelet is not healthy"
 	kubectl get --raw=/readyz >/dev/null
+	kubectl auth can-i delete nodes | grep -qx yes ||
+		die "management kubeconfig cannot delete Nodes"
+	if [[ -n $controller_kubeconfig ]]; then
+		[[ -f $controller_kubeconfig ]] || die "Controller kubeconfig does not exist"
+		validate_route_kubeconfig "$controller_kubeconfig"
+	elif [[ -f $output_path ]]; then
+		validate_route_kubeconfig "$output_path"
+	fi
 	if is_standalone; then
 		if phase_is complete; then
 			check_node_status
@@ -446,7 +536,7 @@ preflight_install() {
 	kubectl get node "${node_name}" >/dev/null 2>&1 ||
 		die "Node does not exist before deployment: ${node_name}"
 	node_ready || die "Node is not Ready before deployment: ${node_name}"
-	if [[ -e $ROUTE_MANIFEST || -e $ROUTE_CONFIG_DIR ]]; then
+	if [[ -e $ROUTE_MANIFEST ]]; then
 		phase_is backed-up || die "unmanaged Route Controller files already exist"
 	fi
 	grep -q -- '--egress-selector-config-file' /etc/kubernetes/manifests/kube-apiserver.yaml &&
@@ -627,6 +717,8 @@ rollback_node() {
 	install -d -m 700 "${state_dir}"
 	exec 9>"${state_dir}/lock"
 	flock -n 9 || die "another operation is using ${state_dir}"
+	kubectl auth can-i patch nodes | grep -qx yes ||
+		die "management kubeconfig cannot patch Nodes"
 	resolve_rollback_backup
 	stop_route_controller
 	restore_kubelet
@@ -653,38 +745,86 @@ delete_rbac() {
 	log "deleted Route Controller RBAC and token Secret"
 }
 
+cleanup() {
+	[[ -z $bundle_dir ]] || rm -rf -- "$bundle_dir"
+	[[ -z $temporary_dir ]] || rm -rf -- "$temporary_dir"
+}
+trap cleanup EXIT
+
+require_admin() {
+	[[ -n $admin_kubeconfig ]] ||
+		die "management credentials required: specify --admin-kubeconfig"
+	local file
+	local -a files
+	IFS=: read -r -a files <<<"$admin_kubeconfig"
+	for file in "${files[@]}"; do
+		[[ -f $file ]] || die "management kubeconfig file does not exist"
+	done
+	export KUBECONFIG=$admin_kubeconfig
+}
+
+confirm_changes() {
+	((assume_yes)) && return
+	[[ -t 0 ]] || die "non-interactive execution requires --yes"
+	local answer
+	read -r -p "Run ${action} on ${node_name}? [y/N] " answer
+	[[ $answer == y || $answer == Y ]] || die "cancelled"
+}
+
+create_bundle() {
+	bundle_dir=$(mktemp -d)
+	install -d -m 700 "$bundle_dir/deploy"
+	install -m 600 "$project_dir/deploy/standalone/kubelet-standalone-merge.json" "$bundle_dir/"
+	install -m 644 "$project_dir/deploy/standalone/20-standalone.conf" "$bundle_dir/"
+	install -m 600 "$project_dir/deploy/rbac/rbac.yaml" "$bundle_dir/deploy/route-controller-rbac.yaml"
+	install -m 600 "$project_dir/deploy/static-pod/image.yaml" "$bundle_dir/deploy/route-controller-static-pod.yaml"
+}
+
+if [[ -n $admin_kubeconfig ]]; then
+	[[ -f $admin_kubeconfig ]] || die "admin kubeconfig does not exist"
+elif [[ -n ${KUBECONFIG:-} ]]; then
+	admin_kubeconfig=$KUBECONFIG
+elif [[ -f /etc/kubernetes/admin.conf ]]; then
+	admin_kubeconfig=/etc/kubernetes/admin.conf
+elif [[ -f $HOME/.kube/config ]]; then
+	admin_kubeconfig=$HOME/.kube/config
+fi
+
+require_command kubectl
+require_command jq
 case $action in
-check)
-	check_node_status
+kubeconfig)
+	((check_only == 0 && remove_rbac == 0)) || die "unsupported kubeconfig option"
+	confirm_changes
+	create_bundle
+	create_route_kubeconfig
 	;;
-check-deploy)
-	check_deploy
-	;;
-preflight-install)
-	preflight_install
-	;;
-cluster-check)
+deploy | check)
+	require_admin
+	kubectl auth can-i get daemonsets.apps -n kube-system | grep -qx yes ||
+		die "management kubeconfig cannot inspect Cilium DaemonSet"
+	create_bundle
 	check_cluster
-	;;
-configure-cilium)
-	configure_cilium
-	;;
-rollback-cilium)
-	rollback_cilium
-	;;
-install)
-	install_node
-	;;
-check-rollback)
-	check_rollback
+	check_deploy
+	if [[ $action == deploy && $check_only == 0 ]]; then
+		[[ $route_image =~ ^[A-Za-z0-9._/:@+-]+@sha256:[a-f0-9]{64}$ ]] ||
+			die "--image must use an immutable sha256 digest"
+		confirm_changes
+		install_node
+		check_cluster
+		check_node_status
+	fi
 	;;
 rollback)
-	rollback_node
-	;;
-delete-rbac)
-	delete_rbac
-	;;
-*)
-	die "unknown action: ${action}"
+	require_admin
+	create_bundle
+	if ((check_only)); then
+		check_rollback
+	else
+		confirm_changes
+		rollback_node
+		((remove_rbac == 0)) || delete_rbac
+		check_node_status
+	fi
 	;;
 esac
