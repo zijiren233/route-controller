@@ -25,8 +25,11 @@ require_command() {
 }
 
 usage() {
+	local topic=${1:-all}
 	cat <<'EOF'
 Usage: deploy/scripts/standalone.sh COMMAND [options]
+       deploy/scripts/standalone.sh help [COMMAND]
+       deploy/scripts/standalone.sh COMMAND --help
 
 Commands:
   deploy       Convert the current node and install the Static Pod.
@@ -44,20 +47,160 @@ Options:
   --tls-server-name NAME   Generated TLS name (default from admin kubeconfig).
   --image IMAGE@sha256:... Immutable workflow image; required for deploy.
   --node-name NAME         Current node name (default hostname).
-  --state-dir PATH         Persistent backup directory.
+  --state-dir PATH         Backup directory (default /var/lib/standalone-kubelet-manager).
   --legacy-backup-dir PATH Legacy rollback backup.
   --timeout SECONDS        Convergence timeout (default 300).
   --skip-cilium-cleanup    Only for nodes with Cilium host state already cleaned.
   --allow-workloads        Permit conversion with ordinary workloads present.
   --delete-rbac            Remove shared RBAC after the final rollback.
   --check                  Read-only preflight for deploy or rollback.
-  --yes                    Confirm changes without prompting.
+  --yes                    Confirm changes; required for non-interactive execution.
   -h, --help               Show help.
 
 Run as root on each target node. Cilium configuration is never modified.
 Node conversion/rollback requires management credentials even when Controller
 credentials are supplied. Generated credentials use a dedicated ServiceAccount.
 Existing complete deployments are checked only; deploy does not upgrade images.
+EOF
+	if [[ $topic == all || $topic == deploy || $topic == check ]]; then
+		cat <<'EOF'
+
+DEPLOY / CHECK
+  Run on the target control-plane node with root privileges and management
+  credentials. Keep this script in the repository's deploy/scripts directory;
+  the adjacent RBAC, Static Pod, and kubelet templates are required.
+  --node-name must match the Kubernetes Node name if it differs from hostname.
+  check and deploy --check do not modify the node or Kubernetes resources.
+
+  Prerequisites:
+    - Healthy kubelet, API Server, Node, and Cilium; working CRI and systemd.
+    - Cilium bpf.lbExternalClusterIP=true, worker ip_forward=1 and all.rp_filter=0.
+      Configure these beforehand; the script never changes Cilium settings.
+    - Migrate ordinary workloads before conversion. --allow-workloads bypasses
+      the check; it does not drain the node or migrate workloads.
+    - Validate direct API Server networking and remove egress-selector config
+      beforehand. The script does not modify API Server or Konnectivity.
+    - Tools: bash, kubectl, jq, base64, crictl, curl, flock, ip, pgrep, sed,
+      systemctl, tar, and standard core utilities. Helm is not required.
+
+  Recommended sequence (from the repository root on ONE node at a time):
+    ADMIN=/path/to/admin.conf
+    IMAGE='ghcr.io/zijiren233/route-controller@sha256:<64-hex-digest>'
+    sudo deploy/scripts/standalone.sh check --admin-kubeconfig "$ADMIN"
+    sudo deploy/scripts/standalone.sh deploy --admin-kubeconfig "$ADMIN" \
+      --image "$IMAGE" --yes
+    sudo deploy/scripts/standalone.sh check --admin-kubeconfig "$ADMIN"
+    curl -fsS http://127.0.0.1:9919/readyz
+    curl -fsS http://127.0.0.1:9918/status
+    ip -4 route show table 254 proto 99
+
+  Replace the digest placeholder with a successful GitHub Actions image digest.
+  Validate Pod IP, ClusterIP, logs, exec, and port-forward before the next node.
+  To supply pre-created Controller credentials during deployment, also pass:
+    --kubeconfig /path/to/controller.conf
+
+  Conversion cleans the current node's old Cilium data plane after stopping it.
+  Use --skip-cilium-cleanup only if host state has already been cleaned.
+  Retain --state-dir for rollback; reuse the same path on subsequent commands.
+  Failed conversions retain their phase and backups: roll back before retrying.
+  An existing complete deployment is checked only, even with a different image.
+  For image upgrades, pre-pull the digest, back up the Static Pod manifest outside
+  the watched manifests directory, and atomically replace its image configuration.
+  Verify the new container's image and readiness before proceeding to another node.
+EOF
+	fi
+	if [[ $topic == all || $topic == kubeconfig || $topic == deploy ]]; then
+		cat <<'EOF'
+
+CREDENTIALS / KUBECONFIG
+  Management credential discovery, in priority order:
+    1. --admin-kubeconfig FILE
+    2. KUBECONFIG (one file or a colon-separated list)
+    3. /etc/kubernetes/admin.conf
+    4. ~/.kube/config (the executing user's home)
+  Prefer an explicit path with sudo: its environment and home may differ.
+  Explicit invalid paths fail instead of falling back to another identity.
+
+  Controller credential selection, in priority order:
+    1. --kubeconfig FILE: import that file's current context.
+    2. Existing destination file: validate and reuse its credentials.
+    3. Generate a dedicated ServiceAccount kubeconfig using management credentials.
+  Destination: /etc/kubernetes/route-controller/kubeconfig.
+  --output /absolute/path is supported only by the kubeconfig command.
+  Import embeds certificate files and writes mode 0600. Exec plugins,
+  auth-provider plugins, and tokenFile references are unsupported in imports.
+  Import/reuse does not require management credentials; validation needs API access.
+  The supplied credentials must have Controller list/watch and ConfigMap access.
+  Supply dedicated Controller credentials, not an admin identity, for the Pod.
+
+  Generate using an admin file at any location:
+    sudo deploy/scripts/standalone.sh kubeconfig \
+      --admin-kubeconfig /path/to/admin.conf --yes
+
+  Import a portable Controller kubeconfig (also embeds referenced certificates):
+    sudo deploy/scripts/standalone.sh kubeconfig \
+      --kubeconfig /path/to/controller.conf --yes
+
+  Automatically reuse the existing destination; generate only if it is absent:
+    sudo deploy/scripts/standalone.sh kubeconfig --yes
+
+  Generate on another machine for a target control plane:
+    sudo deploy/scripts/standalone.sh kubeconfig \
+      --admin-kubeconfig /path/to/admin.conf \
+      --output /secure/output/controller.conf \
+      --api-server https://api.example.com:6443 \
+      --tls-server-name api.example.com --yes
+  Transfer the generated file securely, then import it on the target node.
+  The endpoint must be reachable during validation and from the target Pod,
+  with a matching certificate. Generation inherits the admin endpoint/TLS name
+  unless overridden; import/reuse preserves the supplied endpoint/TLS settings.
+  Existing destinations are reused even when an admin file is supplied. To
+  generate a fresh file, use a new --output path and then explicitly import it.
+  Generated credentials use a long-lived token Secret. Protect the file and
+  coordinate token rotation across all control planes sharing that account.
+EOF
+	fi
+	if [[ $topic == all || $topic == rollback ]]; then
+		cat <<'EOF'
+
+ROLLBACK
+  Restores kubelet registration, original Node labels and taints, and waits for
+  Node/Cilium readiness before removing Controller routes and local credentials.
+  Root handles local files/services/routes. Management credentials patch Node
+  metadata; kubelet re-registers using its own original credentials.
+  Controller's read-only credentials cannot perform the metadata restoration.
+
+  Preview, then restore ONE node:
+    sudo deploy/scripts/standalone.sh rollback \
+      --admin-kubeconfig /path/to/admin.conf --check
+    sudo deploy/scripts/standalone.sh rollback \
+      --admin-kubeconfig /path/to/admin.conf --yes
+
+  For an earlier manual installation, add:
+    --legacy-backup-dir /path/to/original-backup
+  For a custom deployment state directory, use the original --state-dir value.
+  Rollback --check validates backup files and local standalone state; it does
+  not prove that later API writes, registration, or Cilium recovery will succeed.
+
+  Shared RBAC and the token are retained by default. Only after confirming that
+  no other Controller needs them, add --delete-rbac to the FINAL node rollback.
+  This requires permission to delete those shared Kubernetes resources.
+  No Cilium release configuration is restored or modified.
+  To revert only a Controller image, restore its previous Static Pod manifest;
+  rollback reverses the entire standalone conversion.
+EOF
+	fi
+	cat <<'EOF'
+
+RUNTIME FILES AND EXIT STATUS
+  /etc/kubernetes/manifests/route-controller.yaml       Static Pod manifest
+  /etc/kubernetes/route-controller/kubeconfig           Controller credentials
+  /var/lib/kubelet/standalone-config.yaml               Standalone kubelet config
+  /etc/systemd/system/kubelet.service.d/20-standalone.conf
+  /var/lib/standalone-kubelet-manager                   Default state and backups
+  Exit 0 means success (including help); nonzero means failure. Read the error
+  and saved phase before retrying a failed operation. Help requires neither
+  root privileges nor kubectl and does not access the cluster.
 EOF
 }
 
@@ -67,6 +210,17 @@ action=${1:-}
 	exit 2
 }
 shift
+
+if [[ $action == help ]]; then
+	(($# <= 1)) || die "usage: standalone.sh help [COMMAND]"
+	case ${1:-all} in
+	all | deploy | check | rollback | kubeconfig)
+		usage "${1:-all}"
+		exit 0
+		;;
+	*) die "unknown help topic: $1" ;;
+	esac
+fi
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 readonly project_dir
@@ -126,7 +280,7 @@ while (($#)); do
 		shift
 		;;
 	-h | --help)
-		usage
+		usage "$action"
 		exit 0
 		;;
 	--state-dir)
