@@ -287,6 +287,7 @@ create_route_kubeconfig() {
 	fi
 	if [[ -n $source ]]; then
 		[[ -f $source ]] || die "Controller kubeconfig does not exist"
+		log "importing Controller kubeconfig (local operation; no API request)"
 		temporary_dir=$(mktemp -d)
 		kubectl --kubeconfig="$source" config view --raw --flatten --minify -o json >"$temporary_dir/config"
 		jq -e '(.users | length) == 1 and
@@ -310,7 +311,9 @@ generate_route_kubeconfig() {
 	cluster_config=$(kubectl config view --minify -o json)
 	[[ -n $api_server ]] || api_server=$(jq -er '.clusters[0].cluster.server' <<<"$cluster_config")
 	[[ -n $tls_server_name ]] || tls_server_name=$(jq -r '.clusters[0].cluster["tls-server-name"] // ""' <<<"$cluster_config")
+	log "applying Controller RBAC, ServiceAccount, and token Secret"
 	kubectl apply -f "${project_dir}/deploy/rbac/rbac.yaml"
+	log "waiting for ServiceAccount token (timeout: ${timeout}s)"
 	deadline=$((SECONDS + timeout))
 	token_base64=
 	ca_base64=
@@ -322,6 +325,7 @@ generate_route_kubeconfig() {
 		[[ -n $token_base64 && -n $ca_base64 ]] || sleep 1
 	done
 	[[ -n $token_base64 && -n $ca_base64 ]] || die "Route Controller token Secret is incomplete"
+	log "token received; writing Controller kubeconfig"
 	temporary_dir=$(mktemp -d)
 	printf '%s' "${ca_base64}" | base64 --decode >"${temporary_dir}/ca.crt"
 	route_token=$(printf '%s' "${token_base64}" | base64 --decode)
@@ -379,14 +383,13 @@ check_deploy_inputs() {
 		die "existing deployment state; use check or rollback before deploying again"
 	[[ ! -e $KUBELET_DROPIN && ! -e $ROUTE_MANIFEST ]] ||
 		die "existing standalone installation; restore it using its original deployer first"
-	log "local deployment inputs are present"
 }
 check_rollback_inputs() {
 	check_owner
 	[[ -f $backup_dir/complete ]] || die "local backup is incomplete"
-	log "local rollback backup is present"
 }
 finish_staging() {
+	log "reloading systemd configuration"
 	systemctl daemon-reload
 	log "files staged; kubelet is stopped until reboot"
 	if ((reboot)); then
@@ -397,6 +400,7 @@ finish_staging() {
 	fi
 }
 deploy() {
+	log "checking local deployment inputs"
 	check_deploy_inputs
 	confirm_changes
 	lock_state
@@ -406,17 +410,25 @@ deploy() {
 	output_path=$render_dir/kubeconfig
 	controller_kubeconfig=${controller_kubeconfig:-$ROUTE_KUBECONFIG}
 	create_route_kubeconfig
+	log "rendering standalone kubelet configuration and Controller Static Pod"
 	kubectl patch --local -f "$KUBELET_CONFIG" --type=merge \
 		--patch-file "$project_dir/deploy/standalone/kubelet-standalone-merge.json" -o yaml \
 		>"$render_dir/standalone-config.yaml"
 	kubectl set image --local -f "$project_dir/deploy/static-pod/image.yaml" \
 		"controller=$route_image" -o yaml >"$render_dir/route-controller.yaml"
+	log "pulling Controller image: $route_image"
+	log "image pull may take several minutes; kubelet has not been stopped"
+	local pull_started=$SECONDS
 	crictl pull "$route_image" >/dev/null
+	log "Controller image ready (elapsed: $((SECONDS - pull_started))s)"
+	log "backing up local files to $backup_dir"
 	backup_files
 	printf '%s\n' "$OWNER" >"$state_dir/owner"
 	cat /proc/sys/kernel/random/boot_id >"$state_dir/boot-id"
 	write_phase staging-deploy
+	log "stopping kubelet"
 	systemctl stop kubelet
+	log "installing standalone configuration, credentials, and Static Pod manifest"
 	install -m 600 "$render_dir/standalone-config.yaml" "$STANDALONE_CONFIG"
 	install -d -m 755 "$(dirname "$KUBELET_DROPIN")"
 	install -m 644 "$project_dir/deploy/standalone/20-standalone.conf" "$KUBELET_DROPIN"
@@ -427,36 +439,47 @@ deploy() {
 	finish_staging
 }
 rollback() {
+	log "checking local rollback backup"
 	check_rollback_inputs
 	confirm_changes
 	lock_state
 	check_rollback_inputs
 	cat /proc/sys/kernel/random/boot_id >"$state_dir/boot-id"
 	write_phase staging-rollback
+	log "stopping kubelet"
 	systemctl stop kubelet
 	# Stopping kubelet alone leaves its containers running and routes reconciling.
 	local containers container
+	log "locating Controller containers in the local CRI runtime"
 	containers=$(crictl ps -o json | jq -er '[.containers[] |
         select(.metadata.name == "controller" and
             .labels["io.kubernetes.pod.namespace"] == "kube-system" and
             (.labels["io.kubernetes.pod.name"] // "" | startswith("route-controller-"))) |
         .id] | join("\n")')
 	while IFS= read -r container; do
-		[[ -z $container ]] || crictl stop "$container" >/dev/null
+		if [[ -n $container ]]; then
+			log "stopping Controller container: $container"
+			crictl stop "$container" >/dev/null
+		fi
 	done <<<"$containers"
+	log "clearing Controller IPv4 routes (table 254, protocol 99)"
 	ip -4 route flush table 254 proto 99
+	log "restoring local files from $backup_dir"
 	restore_files
 	if ((reboot)); then
 		write_phase pending-rollback-reboot
 		finish_staging
 	else
+		log "reloading systemd configuration"
 		systemctl daemon-reload
+		log "starting original kubelet"
 		systemctl start kubelet
 		write_phase rolled-back
 		log "files restored and kubelet started; verify Node/Cilium recovery"
 	fi
 }
 check() {
+	log "checking local deployment state and kubelet service"
 	check_owner
 	local current_phase running_cilium
 	current_phase=$(phase)
@@ -472,8 +495,10 @@ check() {
 	if [[ $current_phase == pending-deploy-reboot ]]; then
 		[[ -f $KUBELET_DROPIN && -f $ROUTE_MANIFEST && -f $ROUTE_KUBECONFIG ]] ||
 			die "standalone files are missing"
+		log "checking local CRI containers"
 		running_cilium=$(crictl ps --quiet --name cilium) || die "cannot inspect local CRI containers"
 		[[ -z $running_cilium ]] || die "Cilium is still running locally"
+		log "checking Controller readiness (timeout: 5s) and managed routes"
 		curl -fsS --max-time 5 http://127.0.0.1:9919/readyz >/dev/null ||
 			die "Controller is not ready"
 		[[ -n $(ip -4 route show table 254 proto 99) ]] || die "managed routes are missing"
@@ -485,11 +510,17 @@ check() {
 case $action in
 deploy)
 	for command_name in kubectl jq crictl systemctl flock; do require_command "$command_name"; done
-	if ((check_only)); then check_deploy_inputs; else deploy; fi
+	if ((check_only)); then
+		check_deploy_inputs
+		log "local deployment inputs are present"
+	else deploy; fi
 	;;
 rollback)
 	for command_name in systemctl flock crictl jq ip; do require_command "$command_name"; done
-	if ((check_only)); then check_rollback_inputs; else rollback; fi
+	if ((check_only)); then
+		check_rollback_inputs
+		log "local rollback backup is present"
+	else rollback; fi
 	;;
 check)
 	for command_name in systemctl curl crictl ip; do require_command "$command_name"; done
