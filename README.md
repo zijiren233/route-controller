@@ -207,59 +207,65 @@ port-forward 和 Service webhook，再处理下一台。
 
 ## Standalone Kubelet 自动部署
 
-统一入口为 `deploy/scripts/standalone.sh`，以 root 在每台控制面分别执行：
+统一入口为 `deploy/scripts/standalone.sh`。部署和回滚只修改当前节点文件，使用重启
+清空内核中的旧 Cilium/Controller 路由与 BPF 状态，不需要目标节点上的 admin kubeconfig。
 
 | 命令 | 作用 |
 | --- | --- |
-| `deploy` | 备份、准备凭据、转换 kubelet、清理本机旧 Cilium 数据面、部署 Static Pod |
-| `check` | 部署前只读检查，或已部署节点健康检查 |
-| `rollback` | 恢复 Node 注册和 Cilium Ready 后清理受管路由；支持 `--check` |
-| `kubeconfig` | 单独生成、导入或复用 Controller kubeconfig |
-
-管理凭据按 `--admin-kubeconfig`、`KUBECONFIG`、`/etc/kubernetes/admin.conf`、
-`~/.kube/config` 顺序选择。Controller 凭据优先使用 `--kubeconfig`，否则复用
-`/etc/kubernetes/route-controller/kubeconfig`；文件不存在时通过管理凭据生成。
-导入会内嵌证书并验证权限，目标文件权限为 `0600`。依赖 exec 插件、auth-provider
-或 tokenFile 的导入文件会被拒绝，因为 Static Pod 不具备宿主机认证插件环境。
+| `deploy` | 导入 Controller 凭据、预拉镜像、备份文件、停止 kubelet、写入配置 |
+| `check` | 重启后检查本机 kubelet、Controller、CRI 和受管路由 |
+| `rollback` | 停止 kubelet并恢复部署前文件，不访问 Kubernetes API |
+| `kubeconfig` | 导入或复用凭据；也可在管理机器上通过 admin 生成凭据 |
 
 ```bash
-# 在有管理凭据的机器生成专用文件，再传到目标控制面。
-deploy/scripts/standalone.sh kubeconfig \
-  --admin-kubeconfig /path/to/admin.conf --output /path/to/controller.kubeconfig --yes
+# 目标节点只需预先生成的 Controller kubeconfig。
+IMAGE='ghcr.io/zijiren233/route-controller@sha256:<digest>'
+deploy/scripts/standalone.sh deploy --check \
+  --kubeconfig /secure/controller.conf --image "$IMAGE"
+deploy/scripts/standalone.sh deploy \
+  --kubeconfig /secure/controller.conf --image "$IMAGE" --yes --reboot
+# 重连节点后：
+deploy/scripts/standalone.sh check
 
-# 目标节点直接导入专用文件，无需 admin kubeconfig。
-deploy/scripts/standalone.sh kubeconfig --kubeconfig /path/to/controller.kubeconfig --yes
-
-# 只读检查；管理凭据可以存放在任意路径。
-deploy/scripts/standalone.sh check --admin-kubeconfig /path/to/admin.conf
-
-# 逐台转换，使用 GitHub Actions 产出的不可变 digest。
-deploy/scripts/standalone.sh deploy --admin-kubeconfig /path/to/admin.conf \
-  --image 'ghcr.io/zijiren233/route-controller@sha256:<digest>' --yes
-
-# 回滚预检和执行。
-deploy/scripts/standalone.sh rollback --admin-kubeconfig /path/to/admin.conf --check
-deploy/scripts/standalone.sh rollback --admin-kubeconfig /path/to/admin.conf --yes
+# 无 admin、无 API 连接也可恢复本机文件。
+deploy/scripts/standalone.sh rollback --check
+deploy/scripts/standalone.sh rollback --yes --reboot
+# 重连节点后：
+deploy/scripts/standalone.sh check
 ```
 
-`deploy` 和 `rollback` 涉及删除或修改 Node，仍需要管理凭据；Controller 的专用
-只读凭据不具备这些权限。`kubeconfig` 导入或复用文件时无需管理凭据。
-生成凭据默认继承 admin kubeconfig 的 API 地址和 TLS 名称，可通过 `--api-server` 和 `--tls-server-name` 指定
-目标控制面可以访问且证书匹配的地址。自动部署已包含凭据准备，无需先运行该命令。
+以 root 从项目根目录执行，保留相邻部署模板。省略 `--kubeconfig` 时复用
+`/etc/kubernetes/route-controller/kubeconfig`，不存在则失败；部署不会生成 RBAC。
+导入通过 `kubectl config view --raw --flatten --minify` 内嵌证书，不发起 API 请求。
+不支持 exec/auth-provider/tokenFile；目标文件权限为 `0600`。
 
-部署要求 Cilium 已启用 `bpf.lbExternalClusterIP=true`。脚本只检查其配置，不执行
-Helm 或修改 Cilium 配置。转换时仍清理当前节点退出 Cilium 后遗留的数据面状态。
-原始 Kubelet 配置、Node 元数据和阶段保存在 `/var/lib/standalone-kubelet-manager/`。
-已有完整部署只检查健康，`deploy --image` 不更新镜像；中途失败保留备份，先回滚再重试。
+默认只准备文件并停止 kubelet，需要手动 `systemctl reboot`；`--reboot` 自动请求重启。
+不要在准备文件后、重启前重新启动 kubelet。重启清空内核状态，持久化 Cilium/CNI 文件
+保留。脚本不调用 cilium-dbg、不更改 Cilium/Helm/sysctl，也不删除 Node、Lease 或 RBAC。
+因此保留的 Node 最终会显示 NotReady，部分 Pod API 对象可能陈旧；可由管理员另行处理。
+保留 Node 可让回滚沿用原标签、污点；脚本不会重新创建被外部删除的 Node 元数据。
 
-回滚先停止 Controller 并保留路由，等待 Node 和 Cilium Ready 后清理 protocol 99
-路由及本机 Controller 文件。共享 RBAC 默认保留；最后一台退出后可用 `--delete-rbac`
-显式删除。早期手工部署可用 `--legacy-backup-dir` 指定旧备份。
+操作前自行迁移业务，配置 Cilium external ClusterIP 和 worker 转发/rp_filter，验证并
+处理 EgressSelector/Konnectivity。脚本不再检查集群业务负载或 Cilium DaemonSet 收敛。
+逐台重启并保持其余控制面有足够的 API/etcd 可用性；`check` 通过后，验证 PodIP、
+ClusterIP、logs、exec、port-forward，再操作下一台。回滚后另行确认 Node/Cilium 恢复。
 
-脚本拒绝存在普通工作负载的控制面，`--allow-workloads` 不负责迁移。
-API Server 仍配置 `--egress-selector-config-file` 时也会拒绝转换；应提前验证并完成
-EgressSelectorConfiguration 和 Konnectivity 调整。每台部署后验证 PodIP、ClusterIP、
-logs、exec、port-forward，再处理下一台。
+原始配置 `/var/lib/kubelet/config.yaml` 不变。新增的 standalone 配置、systemd drop-in、
+Controller 清单及凭据记录在 `/var/lib/standalone-kubelet-manager/backup` 中；
+回滚恢复部署前存在的文件，移除新建文件。重启后的 `check` 是只读操作，使用 boot ID
+确认已经重启。中途失败保留备份，使用 `rollback` 恢复。已有部署不会被当作镜像升级。
+回滚后保留备份；再次部署需移走旧状态目录或指定新 `--state-dir`。
+旧版在线转换产生的备份需先使用旧版脚本回滚，再采用本流程。
+
+在管理机器生成凭据并安全传输到目标节点：
+```bash
+deploy/scripts/standalone.sh kubeconfig --admin-kubeconfig /secure/admin.conf \
+  --output /secure/output/controller.conf --api-server https://api.example.com:6443 \
+  --tls-server-name api.example.com --yes
+```
+仅此生成操作需要 admin 并创建共享 RBAC/token；其自动发现顺序为指定路径、
+`KUBECONFIG`、`/etc/kubernetes/admin.conf`、`~/.kube/config`。
+详细参数、示例和恢复说明见 `standalone.sh --help`。
 
 ## 回滚
 
