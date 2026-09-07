@@ -40,7 +40,11 @@ kubectl)
     exit 1
   fi ;;
 crictl)
-  if [[ $1 == pull && -f $TEST_DIR/fail-pull ]]; then exit 1; fi ;;
+  if [[ $1 == pull && -f $TEST_DIR/fail-pull ]]; then exit 1; fi
+  if [[ $1 == stop && -f $TEST_DIR/fail-container-stop ]]; then exit 1; fi
+  if [[ $* == 'ps -o json' ]]; then
+    printf '%s\n' '{"containers":[{"id":"route-test","metadata":{"name":"controller"},"labels":{"io.kubernetes.pod.namespace":"kube-system","io.kubernetes.pod.name":"route-controller-test"}},{"id":"unrelated","metadata":{"name":"controller"},"labels":{"io.kubernetes.pod.namespace":"other","io.kubernetes.pod.name":"route-controller-test"}}]}'
+  fi ;;
 systemctl)
   if [[ $1 == stop && -f $TEST_DIR/fail-stop ]]; then exit 1; fi ;;
 curl) ;;
@@ -85,16 +89,26 @@ printf 'boot-deployed\n' >"$TEST_DIR/boot-id"
 bash "$script" check --state-dir "$state"
 if bash "$script" deploy --state-dir "$state" --image "$image" --yes; then exit 1; fi
 
-# Rollback restores local state without API access and requires another reboot.
+# Failed container shutdown must not clear routes or restore files.
+touch "$TEST_DIR/fail-container-stop"
+if bash "$script" rollback --state-dir "$state" --yes; then exit 1; fi
+! grep -q '^ip -4 route flush' "$TEST_DIR/calls"
+test -f /etc/kubernetes/manifests/route-controller.yaml
+rm "$TEST_DIR/fail-container-stop"
+
+# Default rollback stops only this Controller and restores without reboot.
 bash "$script" rollback --check --state-dir "$state"
-bash "$script" rollback --state-dir "$state" --yes --reboot
+bash "$script" rollback --state-dir "$state" --yes
 test ! -e /etc/kubernetes/manifests/route-controller.yaml
 test ! -e /etc/kubernetes/route-controller/kubeconfig
 test ! -e /var/lib/kubelet/standalone-config.yaml
 test ! -e /etc/systemd/system/kubelet.service.d/20-standalone.conf
-grep -q '^systemctl reboot' "$TEST_DIR/calls"
-if bash "$script" check --state-dir "$state"; then exit 1; fi
-printf 'boot-restored\n' >"$TEST_DIR/boot-id"
+! grep -q '^systemctl reboot' "$TEST_DIR/calls"
+grep -q '^crictl stop route-test$' "$TEST_DIR/calls"
+! grep -q '^crictl stop unrelated$' "$TEST_DIR/calls"
+grep -q '^ip -4 route flush table 254 proto 99$' "$TEST_DIR/calls"
+grep -q '^systemctl start kubelet$' "$TEST_DIR/calls"
+test "$(cat "$TEST_DIR/boot-id")" = boot-deployed
 bash "$script" check --state-dir "$state"
 
 # Preserve a pre-existing Controller kubeconfig, including after interrupted staging.
@@ -103,7 +117,10 @@ state="$TEST_DIR/interrupted"
 touch "$TEST_DIR/fail-stop"
 if bash "$script" deploy --state-dir "$state" --image "$image" --yes; then exit 1; fi
 rm "$TEST_DIR/fail-stop"
-bash "$script" rollback --state-dir "$state" --yes
+bash "$script" rollback --state-dir "$state" --yes --reboot
+if bash "$script" check --state-dir "$state"; then exit 1; fi
+printf 'boot-restored\n' >"$TEST_DIR/boot-id"
+bash "$script" check --state-dir "$state"
 test "$(cat /etc/kubernetes/route-controller/kubeconfig)" = existing-credentials
 test "$(cat /var/lib/kubelet/config.yaml)" = original-kubelet
 `
