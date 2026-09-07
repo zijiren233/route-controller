@@ -179,13 +179,13 @@ tag 发布通过 GoReleaser 生成 Linux 二进制和 checksum；容器 workflow
 先在有管理员 kubeconfig 的控制面创建最小 RBAC 和专用 kubeconfig：
 
 ```bash
-sudo deploy/scripts/bootstrap-kubeconfig.sh
+sudo deploy/scripts/standalone.sh kubeconfig --admin-kubeconfig /path/to/admin.conf
 ```
 
 standalone Kubelet 不会为 Static Pod 注入 ServiceAccount token。脚本创建显式长期 token
-Secret，并生成只连接本机 `https://127.0.0.1:6443` 的 kubeconfig；生产环境应限制该文件
+Secret，并生成继承 admin API 地址和 TLS 名称的 kubeconfig；生产环境应限制该文件
 权限并建立 token 轮换流程。API Server 证书使用其他 DNS SAN 时，通过
-`ROUTE_CONTROLLER_TLS_SERVER_NAME` 设置校验名称。
+`--tls-server-name` 设置校验名称。
 
 生产镜像清单位于 [deploy/static-pod/image.yaml](deploy/static-pod/image.yaml)。容器
 workflow 向 GHCR 发布分支标签和 `sha-<commit>` 标签；清单中的 `main` 仅用于展示，
@@ -207,65 +207,59 @@ port-forward 和 Service webhook，再处理下一台。
 
 ## Standalone Kubelet 自动部署
 
-仓库提供只操作当前节点的部署和回滚脚本。运维人员需要登录每台控制面，先执行预检，
-再逐台人工确认切换；脚本自身不连接或编排其他节点：
+统一入口为 `deploy/scripts/standalone.sh`，以 root 在每台控制面分别执行：
 
-- `deploy/scripts/deploy-standalone.sh`：备份节点状态、创建 Route Controller RBAC 和
-  kubeconfig、生成 standalone Kubelet 配置、预拉取不可变镜像、删除 Node、清理旧
-  Cilium 主机数据面，最后部署 Route Controller Static Pod 并验证 ClusterIP。
-- `deploy/scripts/rollback-standalone.sh`：先停止 Route Controller 并保留受管路由，恢复
-  Kubelet 注册并等待 Node 和 Cilium Agent Ready，再清理 protocol 99 路由、本机配置
-  和 kubeconfig。共享 RBAC 仅在显式传入 `--delete-rbac` 时删除。
+| 命令 | 作用 |
+| --- | --- |
+| `deploy` | 备份、准备凭据、转换 kubelet、清理本机旧 Cilium 数据面、部署 Static Pod |
+| `check` | 部署前只读检查，或已部署节点健康检查 |
+| `rollback` | 恢复 Node 注册和 Cilium Ready 后清理受管路由；支持 `--check` |
+| `kubeconfig` | 单独生成、导入或复用 Controller kubeconfig |
 
-Route Controller 启动后自动从本机 API Server 和内核路由获取配置，部署脚本不会生成、
-挂载或持久化 Route Controller 配置文件。默认使用 main route table `254`、route
-protocol `99` 和 active 模式。镜像参数必须是容器 workflow 发布的不可变 OCI digest。
-
-```bash
-ROUTE_CONTROLLER_IMAGE='ghcr.io/zijiren233/route-controller@sha256:<digest>'
-
-# 在当前控制面执行健康检查或部署预检；不会修改节点或 Kubernetes 资源。
-deploy/scripts/deploy-standalone.sh \
-  --check
-
-# 只转换当前控制面；成功后再人工登录下一台重复执行。
-deploy/scripts/deploy-standalone.sh \
-  --image "${ROUTE_CONTROLLER_IMAGE}" \
-  --yes
-```
-
-部署要求 Cilium 已启用 `bpf.lbExternalClusterIP=true`。未启用时，额外传入控制面上的
-Sealos Cilium chart 目录，脚本会保留现有 release values、只开启该参数并滚动 Agent：
+管理凭据按 `--admin-kubeconfig`、`KUBECONFIG`、`/etc/kubernetes/admin.conf`、
+`~/.kube/config` 顺序选择。Controller 凭据优先使用 `--kubeconfig`，否则复用
+`/etc/kubernetes/route-controller/kubeconfig`；文件不存在时通过管理凭据生成。
+导入会内嵌证书并验证权限，目标文件权限为 `0600`。依赖 exec 插件、auth-provider
+或 tokenFile 的导入文件会被拒绝，因为 Static Pod 不具备宿主机认证插件环境。
 
 ```bash
-deploy/scripts/deploy-standalone.sh \
-  --image "${ROUTE_CONTROLLER_IMAGE}" \
-  --cilium-chart /path/to/cilium-chart \
-  --yes
+# 在有管理凭据的机器生成专用文件，再传到目标控制面。
+deploy/scripts/standalone.sh kubeconfig \
+  --admin-kubeconfig /path/to/admin.conf --output /path/to/controller.kubeconfig --yes
+
+# 目标节点直接导入专用文件，无需 admin kubeconfig。
+deploy/scripts/standalone.sh kubeconfig --kubeconfig /path/to/controller.kubeconfig --yes
+
+# 只读检查；管理凭据可以存放在任意路径。
+deploy/scripts/standalone.sh check --admin-kubeconfig /path/to/admin.conf
+
+# 逐台转换，使用 GitHub Actions 产出的不可变 digest。
+deploy/scripts/standalone.sh deploy --admin-kubeconfig /path/to/admin.conf \
+  --image 'ghcr.io/zijiren233/route-controller@sha256:<digest>' --yes
+
+# 回滚预检和执行。
+deploy/scripts/standalone.sh rollback --admin-kubeconfig /path/to/admin.conf --check
+deploy/scripts/standalone.sh rollback --admin-kubeconfig /path/to/admin.conf --yes
 ```
 
-每台节点的原始 Kubelet 配置、Node 元数据、转换阶段和 Cilium 清理工具保存在
-`/var/lib/standalone-kubelet-manager/`。已有完整部署会直接执行健康检查；中途失败会
-保留当前 `phase` 和备份，使用回滚脚本恢复，不会覆盖初始备份。
+`deploy` 和 `rollback` 涉及删除或修改 Node，仍需要管理凭据；Controller 的专用
+只读凭据不具备这些权限。`kubeconfig` 导入或复用文件时无需管理凭据。
+生成凭据默认继承 admin kubeconfig 的 API 地址和 TLS 名称，可通过 `--api-server` 和 `--tls-server-name` 指定
+目标控制面可以访问且证书匹配的地址。自动部署已包含凭据准备，无需先运行该命令。
 
-```bash
-# 验证当前节点的备份和 standalone 状态。
-deploy/scripts/rollback-standalone.sh --check
+部署要求 Cilium 已启用 `bpf.lbExternalClusterIP=true`。脚本只检查其配置，不执行
+Helm 或修改 Cilium 配置。转换时仍清理当前节点退出 Cilium 后遗留的数据面状态。
+原始 Kubelet 配置、Node 元数据和阶段保存在 `/var/lib/standalone-kubelet-manager/`。
+已有完整部署只检查健康，`deploy --image` 不更新镜像；中途失败保留备份，先回滚再重试。
 
-# 只恢复当前控制面 Node；如果本节点曾修改 Cilium，传入同一 chart 路径。
-deploy/scripts/rollback-standalone.sh \
-  --cilium-chart /path/to/cilium-chart \
-  --yes
-```
+回滚先停止 Controller 并保留路由，等待 Node 和 Cilium Ready 后清理 protocol 99
+路由及本机 Controller 文件。共享 RBAC 默认保留；最后一台退出后可用 `--delete-rbac`
+显式删除。早期手工部署可用 `--legacy-backup-dir` 指定旧备份。
 
-早期手工部署可以通过 `--legacy-backup-dir <local-path>` 使用当前节点上的旧备份目录。
-回滚默认保留其他控制面仍在使用的共享账号和 token；最后一台 Route Controller 完成
-回滚后，通过 `--delete-rbac` 显式删除共享 RBAC。
-
-脚本默认拒绝删除运行普通工作负载的控制面 Node，`--allow-workloads` 仅用于已经完成
-迁移确认的场景。它也会拒绝仍配置 `--egress-selector-config-file` 的 API Server；应先
-按照集群的通信方案验证并移除 EgressSelectorConfiguration 和 Konnectivity，再运行
-自动转换。脚本不会修改这些 API Server 和代理资源。
+脚本拒绝存在普通工作负载的控制面，`--allow-workloads` 不负责迁移。
+API Server 仍配置 `--egress-selector-config-file` 时也会拒绝转换；应提前验证并完成
+EgressSelectorConfiguration 和 Konnectivity 调整。每台部署后验证 PodIP、ClusterIP、
+logs、exec、port-forward，再处理下一台。
 
 ## 回滚
 
