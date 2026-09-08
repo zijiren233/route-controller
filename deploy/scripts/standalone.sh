@@ -104,7 +104,10 @@ ROLLBACK: NO REBOOT, API CONNECTIVITY, OR ADMIN REQUIRED
   restore files, daemon-reload, then start kubelet. Controller must stop before
   clearing routes so it cannot recreate them. Other Static Pods keep running.
   Original kubelet credentials/configuration rejoin the retained Node.
-  Confirm Node and Cilium recovery separately. --reboot remains optional.
+  Confirm Node and Cilium recovery separately. If the Node was deleted during
+  testing, check its role labels and taints after re-registration; kubelet does
+  not recreate those metadata fields. Restore them from another control-plane
+  Node with an administrator kubeconfig if needed. --reboot remains optional.
   Pre-existing files are restored; newly created files removed; RBAC untouched.
   Keep the same --state-dir. Old live-conversion backups require that older
   script's rollback first: that version deleted Node metadata.
@@ -247,8 +250,21 @@ trap cleanup EXIT
 confirm_changes() {
 	((assume_yes)) && return
 	[[ -t 0 ]] || die "non-interactive execution requires --yes"
-	local answer
-	read -r -p "Run $action on this machine (deploy/rollback stop kubelet)? [y/N] " answer
+	local answer prompt
+	case $action in
+	deploy) prompt="Stage standalone deployment and stop kubelet (reboot required)" ;;
+	rollback) prompt="Stop kubelet and Controller, clear Controller routes, and restore original files" ;;
+	kubeconfig)
+		if [[ -n $controller_kubeconfig ]]; then
+			prompt="Import Controller kubeconfig into $output_path (local files only; kubelet unchanged)"
+		elif [[ -f $output_path ]]; then
+			prompt="Reuse Controller kubeconfig at $output_path (local files only; kubelet unchanged)"
+		else
+			prompt="Apply Controller RBAC/token resources and generate $output_path (kubelet unchanged)"
+		fi
+		;;
+	esac
+	read -r -p "$prompt? [y/N] " answer
 	[[ $answer == y || $answer == Y ]] || die "cancelled"
 }
 phase() { if [[ -f $state_dir/phase ]]; then cat "$state_dir/phase"; else printf none; fi; }
@@ -369,6 +385,34 @@ restore_files() {
 		fi
 	done
 }
+deployment_state_conflict() {
+	local current_phase script new_state
+	current_phase=$(phase)
+	script=$project_dir/deploy/scripts/standalone.sh
+	log "existing deployment state: $state_dir (phase: $current_phase)"
+	log "Backups are retained after rollback and cannot be overwritten by deploy."
+	log "Inspect the previous operation:"
+	printf '  sudo bash %q check --state-dir %q\n' "$script" "$state_dir"
+	if [[ $current_phase == rolled-back || $current_phase == pending-rollback-reboot ]]; then
+		if [[ $current_phase == pending-rollback-reboot ]]; then
+			log "Complete the pending rollback reboot first: sudo systemctl reboot"
+		fi
+		log "After check succeeds and Node/Cilium recovery is verified, deploy using a NEW state directory:"
+		new_state="${state_dir}-$(date +%Y%m%d-%H%M%S)"
+		printf '  sudo bash %q deploy --state-dir %q --kubeconfig %q --image %q\n' \
+			"$script" "$new_state" "${controller_kubeconfig:-$ROUTE_KUBECONFIG}" "$route_image"
+		log "After successful staging, reboot: sudo systemctl reboot"
+		log "Keep this new state path for subsequent check and rollback:"
+		printf '  sudo bash %q check --state-dir %q\n' "$script" "$new_state"
+		printf '  sudo bash %q rollback --state-dir %q\n' "$script" "$new_state"
+	else
+		log "Before redeploying, restore the previous deployment (this stops kubelet and Controller):"
+		printf '  sudo bash %q rollback --state-dir %q\n' "$script" "$state_dir"
+		log "Rollback may restore/remove Controller credentials; prepare kubeconfig again if needed."
+		log "Then retry deploy for instructions using a new state directory. Older backups need their original deployer."
+	fi
+	die "deployment cancelled; existing backups preserved"
+}
 check_deploy_inputs() {
 	local file
 	for file in "$KUBELET_CONFIG" "$project_dir/deploy/standalone/kubelet-standalone-merge.json" \
@@ -380,7 +424,7 @@ check_deploy_inputs() {
 	[[ -f ${controller_kubeconfig:-$ROUTE_KUBECONFIG} ]] ||
 		die "provide --kubeconfig or prepare $ROUTE_KUBECONFIG first"
 	[[ ! -e $state_dir/owner && ! -e $backup_dir ]] ||
-		die "existing deployment state; use check or rollback before deploying again"
+		deployment_state_conflict
 	[[ ! -e $KUBELET_DROPIN && ! -e $ROUTE_MANIFEST ]] ||
 		die "existing standalone installation; restore it using its original deployer first"
 }
@@ -466,6 +510,7 @@ rollback() {
 	ip -4 route flush table 254 proto 99
 	log "restoring local files from $backup_dir"
 	restore_files
+	log_node_metadata_hint
 	if ((reboot)); then
 		write_phase pending-rollback-reboot
 		finish_staging
@@ -477,6 +522,20 @@ rollback() {
 		write_phase rolled-back
 		log "files restored and kubelet started; verify Node/Cilium recovery"
 	fi
+}
+# Example variables must be expanded by the administrator, not this script.
+# shellcheck disable=SC2016
+log_node_metadata_hint() {
+	log "Node metadata is not checked or restored by this script (no API access)."
+	log "If the Node was deleted, re-registration does not restore its original labels/taints."
+	log "After Node recovery, run on a management machine with Node write permissions:"
+	log "  NODE='<actual-node-name>'"
+	log "  ADMIN_KUBECONFIG='/path/to/admin.conf'"
+	log '  kubectl --kubeconfig "$ADMIN_KUBECONFIG" get node "$NODE" -o yaml'
+	log "Restore missing labels/taints from the original configuration; another control plane may help as a reference."
+	log "Examples ONLY if these match the original configuration (NoSchedule restricts scheduling):"
+	log '  kubectl --kubeconfig "$ADMIN_KUBECONFIG" label node "$NODE" node-role.kubernetes.io/control-plane='
+	log '  kubectl --kubeconfig "$ADMIN_KUBECONFIG" taint node "$NODE" node-role.kubernetes.io/control-plane:NoSchedule'
 }
 check() {
 	log "checking local deployment state and kubelet service"
@@ -505,6 +564,7 @@ check() {
 		log "standalone kubelet and Controller are healthy after reboot"
 	else
 		log "restored kubelet is active; verify Node/Cilium recovery"
+		log_node_metadata_hint
 	fi
 }
 case $action in
